@@ -32,6 +32,19 @@ the hang watchdog (`runtime/src/os/hang_watchdog.cpp`): after 15 s without a fra
 lines give each game thread's last import, how many it made, and on Apple its stack as `sub_`
 functions. Not yet confirmed on the device.
 
+Build 12 on the iPhone (watchdog): still black; the main game thread slept in the allocator's
+`RtlEnterCriticalSection` (from `sub_827612B0`) with 0 imports in 15 s while every other game
+thread waited for work, so no thread held the lock: a lost wake-up. The kernel's critical
+sections, events, semaphores and thread suspension waited with C++20 `std::atomic` wait /
+`notify_one`; Apple's C++ library keeps 1- and 4-byte waiters in a shared hash table where
+`notify_one` can wake another address's waiter. Build 13 waits through `kernel/park.h`
+(a mutex and condition variable per address bucket, the condition re-checked under the lock,
+wakes to the whole bucket, a 10 ms re-check). Build 13 also shows a status panel when the game
+gives no picture for 2 s (ui/options_menu.cpp, drawn by the renderer over the last picture or
+black): what is happening and the last 36 log lines; `DR_TEST_STALL=<frame>:<seconds>` holds the
+game to test it. Stack names in `[watchdog]` lines are approximate (the nearest recompiled
+function by host address); the guest `lr` values are exact.
+
 Changes go to the public repository with `scripts/ios/sync-source-repo.ps1` (copies this project's
 source into `deadrising-ios`, the same file lists as `make-source-repo.ps1`, and refuses anything
 made from the game), then commit, push and run the workflow. Tool changes go in through

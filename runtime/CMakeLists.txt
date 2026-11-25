@@ -192,6 +192,26 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     find_library(DR_GAMECONTROLLER GameController REQUIRED)
     find_library(DR_COREHAPTICS CoreHaptics REQUIRED)
     target_link_libraries(DRRecomp PRIVATE ${DR_GAMECONTROLLER} ${DR_COREHAPTICS})
+
+    # The start screen (ios/Launcher.swift, SwiftUI): compiled to an object with swiftc, as the Tunic port
+    # does, and called from src/os/ios_launcher.mm through the Objective-C runtime.
+    execute_process(COMMAND xcrun -f swiftc OUTPUT_VARIABLE DR_SWIFTC OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND xcrun --sdk iphoneos --show-sdk-path OUTPUT_VARIABLE DR_IOS_SDK OUTPUT_STRIP_TRAILING_WHITESPACE)
+    get_filename_component(DR_SWIFT_BIN "${DR_SWIFTC}" DIRECTORY)
+    get_filename_component(DR_SWIFT_USR "${DR_SWIFT_BIN}" DIRECTORY)
+    set(DR_LAUNCHER_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/Launcher.o")
+    add_custom_command(OUTPUT "${DR_LAUNCHER_OBJECT}"
+        COMMAND "${DR_SWIFTC}" -target "arm64-apple-ios${CMAKE_OSX_DEPLOYMENT_TARGET}" -sdk "${DR_IOS_SDK}" -O -parse-as-library
+            -emit-object -module-name DRLauncherUI -wmo "${CMAKE_CURRENT_SOURCE_DIR}/ios/Launcher.swift" -o "${DR_LAUNCHER_OBJECT}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ios/Launcher.swift"
+        COMMENT "Swift: the start screen")
+    set_source_files_properties("${DR_LAUNCHER_OBJECT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+    target_sources(DRRecomp PRIVATE "${DR_LAUNCHER_OBJECT}" src/os/ios_launcher.mm)
+    set_source_files_properties(src/os/ios_launcher.mm PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-fobjc-arc")
+    target_link_options(DRRecomp PRIVATE "-L${DR_IOS_SDK}/usr/lib/swift" "-L${DR_SWIFT_USR}/lib/swift/iphoneos" "-Wl,-rpath,/usr/lib/swift")
+    find_library(DR_UIKIT UIKit REQUIRED)
+    find_library(DR_SWIFTUI SwiftUI REQUIRED)
+    target_link_libraries(DRRecomp PRIVATE ${DR_UIKIT} ${DR_SWIFTUI})
     if (DR_MOLTENVK_FRAMEWORK)
         add_custom_command(TARGET DRRecomp POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:DRRecomp>/Frameworks"

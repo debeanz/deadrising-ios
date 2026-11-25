@@ -185,6 +185,13 @@ bool TouchControls::HandleEvent(const SDL_Event& event)
     return true;
 }
 
+void TouchControls::CancelAll()
+{
+    std::lock_guard lock(g_mutex);
+    g_fingers.clear();
+    Input::SetTouchPad(Input::Pad{});
+}
+
 bool TouchControls::Visible(bool controllerConnected)
 {
     if (!g_enabled)

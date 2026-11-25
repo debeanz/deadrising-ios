@@ -6,6 +6,7 @@
 #include "font_vga16.h"
 
 #include <hid/input.h>
+#include <hid/touch_controls.h>
 #include <os/logger.h>
 #include <user/config.h>
 
@@ -37,6 +38,7 @@ namespace
     uint32_t g_version = 0;
     bool g_open = false;
     std::string g_status; // SetStatus: the panel shown while the game gives no picture
+    bool g_logView = false; // four-finger tap: the live log over the game
     double g_fps = 0.0;          // last measured by the video loop (SetFps)
     int g_shownFps = -1;
     bool g_waitRelease = false; // closed: the game gets input back once everything is released
@@ -131,11 +133,11 @@ namespace
 
     // While the game gives no picture (starting, or stuck): what is going on, and the log's last
     // lines, so the screen is never just black (2026-11-25, the iPhone build).
-    void DrawStatus()
+    void DrawStatus(const std::string& headline, uint8_t alpha)
     {
-        Fill(0, 0, kWidth, kHeight, 8, 10, 14, 235);
+        Fill(0, 0, kWidth, kHeight, 8, 10, 14, alpha);
         Text(24, 18, 2, "Dead Rising (recompiled)", 255, 235, 80);
-        Text(24, 54, 1, g_status, 255, 170, 90);
+        Text(24, 54, 1, headline, 255, 170, 90);
 #if defined(__APPLE__)
         Text(24, 74, 1, "Full log: Files > On My iPhone > Dead Rising > DRRecomp.log. Options: Start + Back.", 150, 150, 150);
 #else
@@ -154,9 +156,10 @@ namespace
     void Redraw()
     {
         std::fill(g_image.begin(), g_image.end(), uint8_t(0));
-        if (!g_status.empty() && !g_open)
-            DrawStatus();
-        if (Config::ShowFps && (g_status.empty() || g_open)) // not over the status panel's title
+        const bool panel = !g_open && (g_logView || !g_status.empty());
+        if (panel)
+            DrawStatus(g_logView ? std::string("Live log. Tap with four fingers to close it.") : g_status, g_logView ? 205 : 235);
+        if (Config::ShowFps && !panel) // not over the status panel's title
         {
             // Frame counter, top left (also while the menu is open).
             const std::string fps = g_shownFps < 0 ? std::string("-- FPS") : std::to_string(g_shownFps) + " FPS";
@@ -199,7 +202,11 @@ namespace
                     help.erase(0, 1);
                 hy += 20;
             }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+            const std::string footer = "Tap a setting to pick it, again to change it. Tap outside, three fingers or B: close";
+#else
             const std::string footer = "Up / Down: choose    Left / Right / A: change    B / Esc / F1: close";
+#endif
             Text((kWidth - TextWidth(footer, 1)) / 2, y1 - 36, 1, footer, 160, 160, 160);
         }
         g_version++;
@@ -221,10 +228,134 @@ namespace
         Redraw();
         LOGN("[options] closed, settings saved");
     }
+
+    void ToggleLog()
+    {
+        g_logView = !g_logView;
+        Redraw();
+        LOGFN("[options] live log {}", g_logView ? "shown" : "hidden");
+    }
+
+    // Touch (iPhone): a tap with three fingers opens or closes the menu, four the live log; while the
+    // menu is open a tap picks a setting (again: changes it) and a tap outside closes it. One gesture
+    // runs from the first finger down to the last finger up.
+    struct Gesture
+    {
+        bool active = false, moved = false, taken = false;
+        int fingers = 0;     // most fingers down at once
+        uint32_t start = 0;  // SDL ticks
+        float firstX = 0, firstY = 0;
+        std::map<SDL_FingerID, std::pair<float, float>> down;
+    } g_gesture;
+
+    // A finger's place in the menu image (drawn over the window's centred 16:9 area).
+    bool MenuPoint(uint32_t windowID, float fx, float fy, int& x, int& y)
+    {
+        int w = 0, h = 0;
+        if (SDL_Window* window = SDL_GetWindowFromID(windowID))
+            SDL_GetWindowSize(window, &w, &h);
+        if (w <= 0 || h <= 0)
+            return false;
+        const float aspect = float(w) / float(h), image = float(kWidth) / float(kHeight);
+        if (aspect > image)
+        {
+            const float part = image / aspect;
+            fx = (fx - (1.0f - part) * 0.5f) / part;
+        }
+        else
+        {
+            const float part = aspect / image;
+            fy = (fy - (1.0f - part) * 0.5f) / part;
+        }
+        x = int(fx * float(kWidth));
+        y = int(fy * float(kHeight));
+        return true;
+    }
+
+    void TapMenu(uint32_t windowID, float fx, float fy)
+    {
+        int x = 0, y = 0;
+        if (!MenuPoint(windowID, fx, fy, x, y))
+            return;
+        const int x0 = 200, x1 = 1080, y0 = 60, y1 = 670; // the panel (Redraw)
+        if (x < x0 || x >= x1 || y < y0 || y >= y1)
+        {
+            Close();
+            return;
+        }
+        const auto& items = Items();
+        const int row = (y - (y0 + 100 - 8)) / 46;
+        if (y < y0 + 100 - 8 || row >= int(items.size()))
+            return;
+        if (row == g_selected)
+            items[size_t(row)].change(1);
+        else
+            g_selected = row;
+        Redraw();
+    }
+
+    bool HandleFinger(const SDL_TouchFingerEvent& finger, uint32_t type)
+    {
+        Gesture& g = g_gesture;
+        if (type == SDL_FINGERDOWN)
+        {
+            if (!g.active)
+            {
+                g = Gesture{};
+                g.active = true;
+                g.start = SDL_GetTicks();
+                g.firstX = finger.x;
+                g.firstY = finger.y;
+            }
+            g.down[finger.fingerId] = { finger.x, finger.y };
+            g.fingers = std::max(g.fingers, int(g.down.size()));
+            if (g.fingers >= 3 && !g.taken)
+            {
+                g.taken = true; // not for the game: let go of what the first fingers pressed
+                TouchControls::CancelAll();
+            }
+        }
+        else if (type == SDL_FINGERMOTION)
+        {
+            auto it = g.down.find(finger.fingerId);
+            if (it != g.down.end() && std::hypot(finger.x - it->second.first, finger.y - it->second.second) > 0.03f)
+                g.moved = true;
+        }
+        else if (type == SDL_FINGERUP)
+        {
+            g.down.erase(finger.fingerId);
+            if (g.down.empty() && g.active)
+            {
+                g.active = false;
+                const bool tap = !g.moved && SDL_GetTicks() - g.start < 600;
+                if (tap && g.fingers == 3)
+                {
+                    LOGN("[options] three-finger tap");
+                    g_open ? Close() : Open();
+                    return true;
+                }
+                if (tap && g.fingers >= 4)
+                {
+                    ToggleLog();
+                    return true;
+                }
+                if (tap && g.fingers == 1 && g_open)
+                {
+                    TapMenu(finger.windowID, g.firstX, g.firstY);
+                    return true;
+                }
+            }
+        }
+        // The game's touch controls get the finger unless it is part of a three- or four-finger tap
+        // or the menu is open.
+        return g.taken || g_open;
+    }
 }
 
 bool OptionsMenu::HandleEvent(const SDL_Event& event)
 {
+    if (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERMOTION || event.type == SDL_FINGERUP)
+        return HandleFinger(event.tfinger, event.type);
     if (event.type != SDL_KEYDOWN || event.key.repeat)
         return false;
     static const bool noPad = getenv("DR_NO_PAD") != nullptr; // test windows: no keyboard (hid/input.cpp)
@@ -247,6 +378,9 @@ bool OptionsMenu::HandleEvent(const SDL_Event& event)
 
 void OptionsMenu::Update()
 {
+    static uint32_t logRefresh = 0;
+    if (g_logView && !g_open && ++logRefresh % 15 == 0)
+        Redraw(); // new log lines
     const Input::Pad pad = Input::GetRawPad();
     static uint16_t previous = 0;
     const uint16_t pressed = pad.buttons & ~previous;
@@ -331,7 +465,7 @@ void OptionsMenu::SetStatus(const std::string& headline)
 
 bool OptionsMenu::Visible()
 {
-    return g_open || Config::ShowFps || !g_status.empty();
+    return g_open || Config::ShowFps || !g_status.empty() || g_logView;
 }
 
 const uint8_t* OptionsMenu::Image(uint32_t& width, uint32_t& height, uint32_t& version)

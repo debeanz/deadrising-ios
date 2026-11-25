@@ -418,6 +418,9 @@ namespace
 }
 
 #include <os/hang_watchdog.h>
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include <os/ios_launcher.h>
+#endif
 
 static int DRMain(int argc, char* argv[]);
 
@@ -470,9 +473,21 @@ static int DRMain(int argc, char* argv[])
 
     // Game folder: first argument, otherwise the folder that holds default.xex next to us.
     std::filesystem::path gamePath = argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::current_path();
+    bool configLoaded = false;
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    if (argc <= 1 && std::filesystem::exists(documents / "game" / "default.xex"))
-        gamePath = documents / "game";
+    if (argc <= 1)
+    {
+        // The start screen (os/ios_launcher.h): the settings, and the game files checked before Play.
+        // The game folder is made on the first start, so the Files app shows where the files go.
+        std::error_code error;
+        std::filesystem::create_directories(documents / "game", error);
+        gamePath = std::filesystem::exists(documents / "game" / "default.xex") || !std::filesystem::exists(documents / "default.xex")
+            ? documents / "game" : documents;
+        g_gamePath = gamePath;
+        Config::Load();
+        configLoaded = true;
+        Launcher::Run(documents, gamePath);
+    }
 #endif
     if (!std::filesystem::exists(gamePath / "default.xex"))
     {
@@ -481,7 +496,8 @@ static int DRMain(int argc, char* argv[])
     }
 
     g_gamePath = gamePath;
-    Config::Load(); // recomp_config.toml in the game folder (user/config.h)
+    if (!configLoaded)
+        Config::Load(); // recomp_config.toml in the game folder (user/config.h)
 
     if (g_memory.base == nullptr)
     {

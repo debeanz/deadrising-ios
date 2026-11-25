@@ -17,6 +17,8 @@ union SDL_Event;
 
 namespace TouchControls
 {
+    // Forget every finger and release the virtual pad (ui/options_menu.cpp: three- and four-finger taps).
+    void CancelAll();
     struct Circle
     {
         float x, y, radius; // pixels of the window / swap chain
