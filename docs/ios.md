@@ -22,6 +22,16 @@ repository). What the first runs needed:
 * The log macros with no arguments (`LOGFN("text")`): `__VA_OPT__(,)` (clang-cl dropped the comma,
   Apple clang does not); `ERROR_INVALID_PARAMETER` defined outside Windows.
 
+First run on an iPhone (build 10, the user's log): the game files were found and the game
+started, then hung after its first frame, right after creating its XMA contexts (on PC the next
+calls are the network start-up and the first input poll). Build 12: the audio thread kept the
+game's mixer waiting while the device queue was full (the iOS audio session not playing), and the
+game's audio set-up waits on its mixer; the mixer now runs in real time regardless and drops the
+output when the device does not play (`[audio] the device is not playing`). Build 12 also has
+the hang watchdog (`runtime/src/os/hang_watchdog.cpp`): after 15 s without a frame, `[watchdog]`
+lines give each game thread's last import, how many it made, and on Apple its stack as `sub_`
+functions. Not yet confirmed on the device.
+
 Changes go to the public repository with `scripts/ios/sync-source-repo.ps1` (copies this project's
 source into `deadrising-ios`, the same file lists as `make-source-repo.ps1`, and refuses anything
 made from the game), then commit, push and run the workflow. Tool changes go in through
