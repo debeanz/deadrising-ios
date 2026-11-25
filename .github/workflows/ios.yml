@@ -95,7 +95,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out" && cp "$log" "$RUNNER_TEMP/out/codegen-${{ github.run_number }}.log"
           cp analysis/shader_cache/xenosrecomp.log "$RUNNER_TEMP/out/xenosrecomp-${{ github.run_number }}.log" 2>/dev/null || true
           # Public log: steps and errors only (no generated code, no per-shader lines).
-          grep -E "^==>|applied|error|generated|exit status|dxcompiler" "$log" | grep -v -E "ppc/|Translated|FAILED" | head -100 || true
+          grep -E "^==>|applied|error|generated|exit status|dxcompiler|^diag:" "$log" | grep -v -E "ppc/|Translated|FAILED" | head -150 || true
           exit $status
 
       - name: Configure (iOS arm64)

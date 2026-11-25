@@ -75,6 +75,18 @@ status=$?
 set -e
 echo "XenosRecomp exit status $status: $(grep -c Translated analysis/shader_cache/xenosrecomp.log || true) translated, $(grep -c FAILED analysis/shader_cache/xenosrecomp.log || true) failed"
 grep -v -E "Translated|FAILED" analysis/shader_cache/xenosrecomp.log | tail -25 || true
+if [ "$status" -ne 0 ] && ! grep -q -E "Translated|FAILED|Recompiling" analysis/shader_cache/xenosrecomp.log; then
+    # It died before naming any shader: these lines are safe for the public log ("diag:").
+    {
+        file "$XENOSRECOMP" "$DXC_LIB/libdxcompiler.dylib"
+        "$XENOSRECOMP" > /dev/null 2>&1; echo "XenosRecomp without arguments: exit status $?"
+        echo "its output:"; head -30 analysis/shader_cache/xenosrecomp.log
+        echo "under lldb:"
+        lldb --batch -o "settings set target.env-vars DYLD_LIBRARY_PATH=$DXC_LIB" -o run -o "bt 40" -o quit -- \
+            "$XENOSRECOMP" analysis/shaders_2008 "$ROOT/build/host/lldb_cache.cpp" tools/XenosRecomp/XenosRecomp/shader_common.h 2>&1 |
+            grep -E "frame #|stop reason|error|exited" | head -60
+    } 2>&1 | sed 's/^/diag: /'
+fi
 test -s analysis/shader_cache/shader_cache.cpp || { echo "error: XenosRecomp wrote no shader_cache.cpp"; exit 1; }
 
 step "Done"
