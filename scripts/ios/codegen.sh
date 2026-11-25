@@ -87,6 +87,14 @@ if [ "$status" -ne 0 ] && ! grep -q -E "Translated|FAILED|Recompiling" analysis/
             grep -E "frame #|stop reason|error|exited" | head -60
     } 2>&1 | sed 's/^/diag: /'
 fi
+if [ "$status" -ne 0 ]; then
+    # The crash handler's stack (function names of the tools only) and how far it got: safe for the
+    # public log ("diag:").
+    {
+        echo "progress lines: $(grep -c Recompiling analysis/shader_cache/xenosrecomp.log || true)"
+        sed -n '/^XenosRecomp: signal/,$p' analysis/shader_cache/xenosrecomp.log | grep -v -E "Translated|FAILED|Recompiling" | head -60
+    } 2>&1 | sed 's/^/diag: /'
+fi
 test -s analysis/shader_cache/shader_cache.cpp || { echo "error: XenosRecomp wrote no shader_cache.cpp"; exit 1; }
 
 step "Done"

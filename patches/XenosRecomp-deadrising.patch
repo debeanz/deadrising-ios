@@ -1,8 +1,8 @@
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index d015145..a004f3e 100644
+index d015145..29c18ef 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
-@@ -1,7 +1,105 @@
+@@ -1,7 +1,108 @@
 +#include <fstream>
 +#include <mutex>
  #include "shader.h"
@@ -92,7 +92,10 @@ index d015145..a004f3e 100644
 +            (*s->function)(*(*s->list)[i]);
 +        return nullptr;
 +    };
-+    const unsigned threads = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
++    // One thread unless XENOS_THREADS says otherwise: the macOS build of DXC crashed when shaders
++    // were compiled on several threads at once (iOS build, 2026-11-25).
++    const char* threadsSetting = getenv("XENOS_THREADS");
++    const unsigned threads = std::max(1u, std::min(threadsSetting ? unsigned(atoi(threadsSetting)) : 1u, 16u));
 +    std::vector<pthread_t> handles(threads);
 +    pthread_attr_t attributes;
 +    pthread_attr_init(&attributes);
@@ -108,7 +111,7 @@ index d015145..a004f3e 100644
  static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
  {
      FILE* file = fopen(filePath, "rb");
-@@ -27,10 +125,15 @@ struct RecompiledShader
+@@ -27,10 +128,15 @@ struct RecompiledShader
      IDxcBlob* dxil = nullptr;
      std::vector<uint8_t> spirv;
      uint32_t specConstantsMask = 0;
@@ -124,7 +127,7 @@ index d015145..a004f3e 100644
  #ifndef XENOS_RECOMP_INPUT
      if (argc < 4)
      {
-@@ -114,27 +217,73 @@ int main(int argc, char** argv)
+@@ -114,27 +220,73 @@ int main(int argc, char** argv)
          }
  
          std::atomic<uint32_t> progress = 0;
@@ -203,7 +206,7 @@ index d015145..a004f3e 100644
  
                  bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
                  assert(result);
-@@ -144,8 +293,14 @@ int main(int argc, char** argv)
+@@ -144,8 +296,14 @@ int main(int argc, char** argv)
                  size_t currentProgress = ++progress;
                  if ((currentProgress % 10) == 0 || (currentProgress == shaders.size() - 1))
                      fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
@@ -219,7 +222,7 @@ index d015145..a004f3e 100644
          fmt::println("Creating shader cache...");
  
          StringBuffer f;
-@@ -157,8 +312,9 @@ int main(int argc, char** argv)
+@@ -157,8 +315,9 @@ int main(int argc, char** argv)
  
          for (auto& [hash, shader] : shaders)
          {
