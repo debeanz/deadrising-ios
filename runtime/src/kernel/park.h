@@ -14,10 +14,10 @@
 // shared hash table, and notify_one there can wake a waiter of another address. Here each wait
 // re-checks its condition under a bucket lock that every wake takes (no wake can fall between the
 // check and the sleep), wakes reach every waiter of the bucket, and a timed wait re-checks in any
-// case, so a waiter never sleeps forever: after 10 ms, then less and less often up to every 100 ms
-// (2026-11-25: every 10 ms for every waiting thread was 4000-6000 wakeups a second on the iPhone,
-// power and a sign to iOS that the work is light). A re-check that finds the wait over counts as a
-// missed wake (MissedWakes, in the "[perf]" report): there should be none.
+// case, every 10 ms, so a waiter never sleeps forever. A re-check that finds the wait over counts
+// as a missed wake (MissedWakes, in the "[perf]" report): none on the PC; on the iPhone they come
+// when the cores are all busy and the waking thread is held up between its change and its wake
+// (2026-11-25: a re-check backing off to 100 ms made those waits longer; back to 10 ms).
 namespace Park
 {
     struct Bucket
@@ -60,7 +60,6 @@ namespace Park
                     MissedWakes().fetch_add(1, std::memory_order_relaxed);
                     return true;
                 }
-                recheck = std::min(recheck * 2, std::chrono::milliseconds(100));
             }
         }
         return true;

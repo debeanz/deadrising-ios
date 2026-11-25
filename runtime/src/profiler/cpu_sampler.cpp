@@ -516,7 +516,7 @@ void CpuSampler::LogStack(const void* context)
 extern "C" int proc_pid_rusage(int pid, int flavor, rusage_info_t* buffer);
 
 // Apple (iPhone, iPad): the CPU profile of the threads the frame waits for. A sampler thread stops each watched thread
-// every 2 ms, reads its call stack (frame-pointer chain) and lets it go on; every 10 s it logs, per thread,
+// every 10 ms, reads its call stack (frame-pointer chain) and lets it go on; every 10 s it logs, per thread,
 // the functions with the most samples ("[cpu]": self = where the thread was, total = anywhere on its stack), runtime and
 // recompiled game functions (sub_XXXXXXXX) alike. 2026-11-25: the iPhone's draw hooks took 5 times a PC's; this says
 // where. DR_HITCH_PROFILE=0 turns it off. Nothing is allocated or locked while a thread is stopped.
@@ -788,7 +788,7 @@ namespace
         auto lastReport = std::chrono::steady_clock::now();
         while (true)
         {
-            usleep(2000);
+            usleep(10000); // every 10 ms (was 2): each sample stops the game's threads for a moment
             const int count = g_watchedCount.load(std::memory_order_acquire);
             for (int i = 0; i < count; i++)
             {

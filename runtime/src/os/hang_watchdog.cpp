@@ -188,8 +188,46 @@ namespace
         return fmt::format("{:X}", address);
     }
 
+    // A write through a null game pointer: the game's page 0 is read-only zeros (kernel/memory.cpp), so the store faults;
+    // it is skipped and the game goes on, as reads there read zero (2026-11-25, the mall: a zombie wrote into the object
+    // it was holding, which another game thread had just let go: stb to 0x2C33 in sub_822AA158; an Xbox 360 would crash
+    // too, but its timing never got there). The first 20 are logged. DR_NULL_WRITES=crash turns this off.
+    bool SkipNullWrite(int signal, siginfo_t* info, void* context)
+    {
+#if defined(__arm64__) || defined(__aarch64__)
+        static const bool enabled = getenv("DR_NULL_WRITES") == nullptr || strcmp(getenv("DR_NULL_WRITES"), "crash") != 0;
+        if (!enabled || (signal != SIGBUS && signal != SIGSEGV) || info == nullptr || context == nullptr || g_memory.base == nullptr)
+            return false;
+        const uintptr_t fault = uintptr_t(info->si_addr);
+        const uintptr_t base = uintptr_t(g_memory.base);
+        if (fault < base || fault >= base + uintptr_t(getpagesize()))
+            return false;
+        ucontext_t* uc = static_cast<ucontext_t*>(context);
+        if (uc->uc_mcontext == nullptr)
+            return false;
+        auto& ss = uc->uc_mcontext->__ss;
+        const uintptr_t pc = uintptr_t(arm_thread_state64_get_pc(ss));
+        static std::atomic<uint32_t> skipped{ 0 };
+        if (skipped.fetch_add(1) < 20)
+        {
+            Dl_info where{};
+            dladdr(reinterpret_cast<void*>(pc), &where);
+            LOGFN_WARNING("[null] write to game address {:04X} at {}+{:X} (game lr {:08X}): skipped", fault - base,
+                where.dli_sname ? where.dli_sname : "?", where.dli_saddr ? pc - uintptr_t(where.dli_saddr) : 0,
+                t_slot != nullptr ? t_slot->lastLr.load() : 0);
+        }
+        arm_thread_state64_set_pc_fptr(ss, reinterpret_cast<void*>(pc + 4)); // every AArch64 instruction is 4 bytes
+        return true;
+#else
+        (void)signal; (void)info; (void)context;
+        return false;
+#endif
+    }
+
     void CrashHandler(int signal, siginfo_t* info, void* context)
     {
+        if (SkipNullWrite(signal, info, context))
+            return;
         if (g_crashing.fetch_add(1) == 0)
         {
             char thread[64] = {};

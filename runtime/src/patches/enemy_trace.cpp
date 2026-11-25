@@ -87,8 +87,10 @@ namespace
     bool Enabled()
     {
         static const bool enabled = [] {
+            // Off unless asked for (2026-11-25): it takes one lock on every traced unit's move, and the game moves its
+            // units on 5 threads at once; on the iPhone's roof and in the mall they queued on it.
             const char* value = getenv("DR_ENEMY_TRACE");
-            return value == nullptr || strcmp(value, "0") != 0;
+            return value != nullptr && strcmp(value, "0") != 0;
         }();
         return enabled;
     }

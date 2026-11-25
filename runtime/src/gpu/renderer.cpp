@@ -26,6 +26,9 @@
 #include <cmath>
 #include <deque>
 #include <plume_render_interface.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <plume_render_interface_builders.h>
 
 #ifdef _WIN32
@@ -4256,24 +4259,56 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
 
 
     // The list from earlier runs (PipelineRecipe): every pipeline in it made in the background, from the start.
-    void LoadPipelineList()
+    // The recipes in one list file (empty if there is none, or it is from another version).
+    std::vector<PipelineRecipe> ReadPipelineList(const std::filesystem::path& path)
     {
-        if (!PipelineListEnabled())
-            return;
-        std::ifstream file(PipelineListPath(), std::ios::binary);
+        std::ifstream file(path, std::ios::binary);
         if (!file)
-            return;
+            return {};
         uint32_t header[4] = {};
         file.read(reinterpret_cast<char*>(header), sizeof(header));
         if (!file || header[0] != kRecipeMagic || header[1] != kRecipeVersion || header[2] != sizeof(PipelineRecipe) || header[3] > 100000)
         {
-            LOGN("[renderer] pipeline list from an earlier version: ignored");
-            return;
+            LOGFN("[renderer] pipeline list {} from an earlier version: ignored", (const char*)path.filename().u8string().c_str());
+            return {};
         }
         std::vector<PipelineRecipe> recipes(header[3]);
         file.read(reinterpret_cast<char*>(recipes.data()), std::streamsize(recipes.size() * sizeof(PipelineRecipe)));
         if (!file)
+            return {};
+        return recipes;
+    }
+
+    // The list shipped with the app: iPhone / iPad, in the app bundle (the build copies it from the private data
+    // repository, release "game-data"); elsewhere next to the executable. Pipelines met in earlier play anywhere, so a
+    // new install (in LiveContainer, a new data folder) has them all made from the start too (2026-11-25: every build
+    // the user installed started with an empty list, and models were missing while their pipelines were made).
+    std::filesystem::path ShippedPipelineListPath()
+    {
+        const char* name = g_vulkan ? "pipelines_vulkan.bin" : "pipelines_d3d12.bin";
+#ifdef _WIN32
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        return std::filesystem::path(path).parent_path() / name;
+#else
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<const void*>(&ShippedPipelineListPath), &info) == 0 || info.dli_fname == nullptr)
+            return {};
+        return std::filesystem::path(info.dli_fname).parent_path() / name;
+#endif
+    }
+
+    void LoadPipelineList()
+    {
+        if (!PipelineListEnabled())
             return;
+        std::vector<PipelineRecipe> recipes = ReadPipelineList(ShippedPipelineListPath());
+        const size_t shipped = recipes.size();
+        std::vector<PipelineRecipe> own = ReadPipelineList(PipelineListPath());
+        recipes.insert(recipes.end(), own.begin(), own.end());
+        if (recipes.empty())
+            return;
+        LOGFN("[renderer] pipeline lists: {} shipped with the app, {} from this device's earlier runs", shipped, own.size());
 
         static std::deque<std::string> s_semantics; // names not in kUsageNames (none expected)
         uint32_t queued = 0, missing = 0;

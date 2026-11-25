@@ -374,10 +374,12 @@ namespace
     }
 
     // Reads through a null guest pointer (guest page 0, kept inaccessible to catch them) read zero
-    // instead of crashing, and are logged: the page is made read-only for the one faulting
-    // instruction (trap flag), then inaccessible again. Writes still crash. Frank's actions read his
-    // held item while another game thread could clear it (2026-11-25: unit updates run as parallel
-    // jobs); a null read there is a zero id, not a crash. DR_NULL_READS=crash turns this off.
+    // instead of crashing, and are logged: the page is opened for the one faulting instruction
+    // (trap flag), then wiped back to zeros and made inaccessible again. Writes there are thrown
+    // away the same way (2026-11-25, iPhone: a zombie wrote into the object it held, just let go by
+    // another game thread). Frank's actions read his held item while another game thread could
+    // clear it (unit updates run as parallel jobs); a null read there is a zero id, not a crash.
+    // DR_NULL_READS=crash turns this off.
     static std::atomic<uint32_t> g_nullSteppers{ 0 };
     static thread_local bool t_nullStep = false;
 
@@ -389,10 +391,13 @@ namespace
             t_nullStep = false;
             DWORD old;
             if (--g_nullSteppers == 0)
+            {
+                memset(g_memory.base, 0, 4096); // a write that went through is thrown away
                 VirtualProtect(g_memory.base, 4096, PAGE_NOACCESS, &old);
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 || info->ExceptionRecord->ExceptionInformation[0] != 0)
+        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 || info->ExceptionRecord->ExceptionInformation[0] > 1)
             return EXCEPTION_CONTINUE_SEARCH;
         const uint64_t fault = info->ExceptionRecord->ExceptionInformation[1];
         if (fault < (uint64_t)g_memory.base || fault >= (uint64_t)g_memory.base + 4096 || t_nullStep)
@@ -402,16 +407,17 @@ namespace
         if (logged++ < 20)
         {
             auto* ctx = GetPPCContext();
-            LOGFN_WARNING("[null] read of guest 0x{:X} at DRRecomp.exe+0x{:X} (guest lr 0x{:08X}); read as zero",
-                fault - (uint64_t)g_memory.base, (uint64_t)info->ExceptionRecord->ExceptionAddress - (uint64_t)GetModuleHandleW(nullptr),
-                ctx ? uint32_t(ctx->lr) : 0);
+            LOGFN_WARNING("[null] {} guest 0x{:X} at DRRecomp.exe+0x{:X} (guest lr 0x{:08X}); {}",
+                info->ExceptionRecord->ExceptionInformation[0] == 1 ? "write to" : "read of", fault - (uint64_t)g_memory.base,
+                (uint64_t)info->ExceptionRecord->ExceptionAddress - (uint64_t)GetModuleHandleW(nullptr),
+                ctx ? uint32_t(ctx->lr) : 0, info->ExceptionRecord->ExceptionInformation[0] == 1 ? "thrown away" : "read as zero");
             CpuSampler::LogStack(info->ContextRecord);
             DumpPlayerTrace();
         }
         t_nullStep = true;
         DWORD old;
         if (g_nullSteppers++ == 0)
-            VirtualProtect(g_memory.base, 4096, PAGE_READONLY, &old);
+            VirtualProtect(g_memory.base, 4096, PAGE_READWRITE, &old); // read-write for all steppers: one may write
         info->ContextRecord->EFlags |= 0x100; // trap after this one instruction
         return EXCEPTION_CONTINUE_EXECUTION;
     }

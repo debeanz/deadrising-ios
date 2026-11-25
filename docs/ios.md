@@ -255,6 +255,30 @@ And the edit meant for 5 pipeline threads had gone to the texture decode pool: s
 The list (and the settings) live in the app's Documents folder: in LiveContainer, keep the app's data folder when
 installing a new build, or it starts empty again.
 
+Build 27 on the iPhone 15: the roof at 60 fps for about 20 s, then 33 fps; thermal state "nominal" throughout, but
+iOS moved the work off the performance cores (57% of the cycles there at 2.6 W, then 4% at 0.7 W, with nearly 10
+cores' worth of threads waiting to run). QoS was right (98% of the CPU time user-interactive, priority 47).
+Pipelines took 0.2-21 s each (MoltenVK compiles Metal shaders on the device; the compiler starves when the cores
+are busy), and every build started in a new LiveContainer data folder, so with an empty list. The game crashed in
+the mall: a zombie wrote into the object it held (`stb` to 0x2C33 in `sub_822AA158`) after another game thread had
+let it go (null). Build 28:
+
+* a write through a null game pointer is skipped instead of crashing (iPhone: the store instruction is stepped
+  over in the signal handler; PC: the page is opened for the one instruction and wiped afterwards), logged as
+  `[null]`; `DR_NULL_WRITES=crash` (iPhone) / `DR_NULL_READS=crash` (PC) turn this off;
+* the enemy and player trace (`[em]`, `[pl]`) is off unless `DR_ENEMY_TRACE=1`: it took one lock on every traced
+  unit's move, and the game moves its units on 5 threads at once;
+* the `[cpu]` sampler samples every 10 ms (was 2: each sample stops the game's threads); waits re-check every
+  10 ms again (the 100 ms back-off made the waits that missed a wake longer);
+* a pipeline list ships in the app: the build copies `pipelines_vulkan.bin` from the private data repository
+  (release "game-data") into the app bundle, and the runtime loads it before the device's own list. The recipes
+  do not depend on the device or the API (the PC's D3D12 and Vulkan lists matched record for record), so lists
+  from the PC and from the phone can be merged into it.
+
+The real fix for shader compiling on the device is the native Metal path: Metal shaders compiled when the IPA is
+built (XenosRecomp-metal makes them, plume has a Metal backend; the UnleashedRecomp iOS port works this way), so
+the device only links pipelines (milliseconds) and MoltenVK's translation leaves the render thread.
+
 ## Screen scaling and widescreen
 
 Screen Scaling (start screen and Settings; `ScreenScaling` in recomp_config.toml): Fit (the game's

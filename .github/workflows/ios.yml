@@ -62,6 +62,12 @@ jobs:
           for f in default.xex shader.arc; do
             echo "$f: $(stat -f %z "$RUNNER_TEMP/gamedata/$f") bytes, SHA-1 $(shasum -a 1 "$RUNNER_TEMP/gamedata/$f" | cut -d' ' -f1)"
           done
+          # The pipelines met in earlier play (optional): shipped in the app, so a new install makes them all from the start.
+          if gh release download game-data --repo "$DATA_REPO" -p pipelines_vulkan.bin -D "$RUNNER_TEMP/gamedata" --clobber 2>/dev/null; then
+            echo "pipelines_vulkan.bin: $(stat -f %z "$RUNNER_TEMP/gamedata/pipelines_vulkan.bin") bytes"
+          else
+            echo "no pipelines_vulkan.bin in the data repository: the app ships without a pipeline list"
+          fi
 
       - name: Tools (Xcode, Ninja, PowerShell)
         run: |
@@ -190,6 +196,9 @@ jobs:
         run: |
           app=$(find build/ios -maxdepth 2 -name "DeadRising.app" -type d | head -1)
           test -n "$app" || { echo "::error::DeadRising.app not found"; exit 1; }
+          if [ -f "$RUNNER_TEMP/gamedata/pipelines_vulkan.bin" ]; then
+            cp "$RUNNER_TEMP/gamedata/pipelines_vulkan.bin" "$app/"
+          fi
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Info.plist"
           file "$app/DeadRising"
           ls "$app/Frameworks" || true
