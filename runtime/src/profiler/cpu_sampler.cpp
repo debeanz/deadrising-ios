@@ -512,6 +512,7 @@ namespace
         uintptr_t low = 0, high = 0;
     };
     Watched g_watched[kThreads];
+    const mach_port_t g_mainThread = pthread_mach_thread_np(pthread_self()); // static initialisation runs on the main thread
     std::atomic<int> g_watchedCount{ 0 };
     std::mutex g_watchMutex;
 
@@ -617,7 +618,7 @@ namespace
         if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS)
             return;
         const bool first = last.empty();
-        const mach_port_t mainThread = pthread_mach_thread_np(pthread_main_thread_np());
+        const mach_port_t mainThread = g_mainThread;
         std::unordered_map<uint64_t, uint64_t> now;
         std::unordered_map<std::string, std::pair<uint64_t, uint32_t>> byName; // ns, threads
         uint64_t allNs = 0;
@@ -691,7 +692,7 @@ namespace
 
         std::vector<std::pair<uint64_t, std::string>> sorted;
         for (const auto& [name, entry] : byName)
-            sorted.emplace_back(entry.first, entry.second.second > 1 ? fmt::format("{} x{}", name, entry.second.second) : name);
+            sorted.emplace_back(entry.first, entry.second > 1 ? fmt::format("{} x{}", name, entry.second) : name);
         std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::string text;
         for (size_t i = 0; i < sorted.size() && i < 16; i++)
