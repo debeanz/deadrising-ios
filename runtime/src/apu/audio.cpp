@@ -66,10 +66,36 @@ namespace
         const uint32_t frameBytes = (g_stereo ? 2 : kChannels) * kSamples * sizeof(float);
         const auto interval = std::chrono::nanoseconds(1000000000ull * kSamples / kSampleRate);
         auto next = std::chrono::steady_clock::now();
+        auto fullSince = next;
+        bool full = false, reported = false;
         while (g_running)
         {
-            if (SDL_GetQueuedAudioSize(g_device) / frameBytes <= 10)
+            // The game's audio waits on its mixer (voices start and stop in it), so the mixer must
+            // run in real time even when the device does not play (iPhone, 2026-11-25: the audio
+            // session not running yet, the queue stayed full and the game hung in its audio set-up
+            // after the first frame). A queue full for over 200 ms is dropped and mixing goes on.
+            const bool room = SDL_GetQueuedAudioSize(g_device) / frameBytes <= 10;
+            const auto start = std::chrono::steady_clock::now();
+            if (!room && !full)
             {
+                full = true;
+                fullSince = start;
+            }
+            if (room)
+                full = false;
+            if (room || start - fullSince > std::chrono::milliseconds(200))
+            {
+                if (!room)
+                {
+                    SDL_ClearQueuedAudio(g_device);
+                    if (!reported)
+                    {
+                        reported = true;
+                        LOGFN_WARNING("[audio] the device is not playing (status {}): mixing goes on, its output is dropped",
+                            int(SDL_GetAudioDeviceStatus(g_device)));
+                    }
+                    full = false;
+                }
                 context.ppcContext.r3.u32 = g_callbackParam;
                 g_memory.FindFunction(g_callback)(context.ppcContext, g_memory.base);
             }
