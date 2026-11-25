@@ -38,6 +38,7 @@
 #define ERROR_SUCCESS              0x0
 #define ERROR_PATH_NOT_FOUND       0x3
 #define ERROR_BAD_ARGUMENTS        0xA0
+#define ERROR_INVALID_PARAMETER    0x57
 #define ERROR_DEVICE_NOT_CONNECTED 0x48F
 #define PAGE_READWRITE             0x04
 
