@@ -38,6 +38,15 @@ apply_patch tools/XenonRecomp XenonRecomp-deadrising.patch
 apply_patch tools/XenosRecomp XenosRecomp-deadrising.patch
 apply_patch tools/plume plume-deadrising.patch
 
+# DR_CODEGEN_PATCH_ONLY=1: ppc/ and analysis/ came from an earlier build (the workflow keeps them in the
+# private data repository when the game files, tools, patches and config are the same).
+if [ "${DR_CODEGEN_PATCH_ONLY:-0}" = 1 ]; then
+    step "Done"
+    echo "generated $(ls ppc/*.cpp | wc -l | tr -d ' ') files in ppc/ (reused from an earlier build)"
+    test -s analysis/shader_cache/shader_cache.cpp || { echo "error: the reused code has no shader_cache.cpp"; exit 1; }
+    exit 0
+fi
+
 step "XenonRecomp (game code)"
 cmake -S tools/XenonRecomp -B build/host/XenonRecomp "${HOST_FLAGS[@]}"
 cmake --build build/host/XenonRecomp --target XenonRecomp

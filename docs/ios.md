@@ -101,6 +101,19 @@ The workflow (`macos-15`, about 1–2 hours):
 
 The public log never shows generated game code (messages about `ppc/` are only counted).
 
+Builds reuse what did not change (2026-11-25: a build took about 8 minutes, 4 of them compiling the
+same generated code again):
+
+* the generated code (`ppc/`, the translated shaders) is kept as `codegen-<key>.tar.zst` in the
+  private data repository's release `build-cache`; the key is a hash of the game files, the two
+  recompilers' commits and patches, `codegen.sh`, `unarc.ps1`, `xfb2xenos` and `config/`. On a match
+  `codegen.sh` only applies the tools' patches (`DR_CODEGEN_PATCH_ONLY=1`);
+* the compiler cache (ccache: every object file by its inputs) is `ccache.tar` in the same release,
+  updated after every build;
+* FFmpeg (nothing from the game) is in this repository's own Actions cache.
+
+Delete the `build-cache` release to start from scratch; the next build makes it again.
+
 ## One-time setup
 
 ```powershell

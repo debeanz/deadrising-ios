@@ -10,7 +10,8 @@
 # Secret GAME_DATA_TOKEN: a fine-grained token with Contents read/write on the data repository.
 #
 # Nothing derived from the game goes into this repository: no artifacts, no caches of generated
-# code, and the public log shows no generated code (messages about ppc/ are only counted).
+# code (they are kept in the private data repository, release "build-cache"), and the public log
+# shows no generated code (messages about ppc/ are only counted).
 name: iOS IPA
 
 on:
@@ -28,6 +29,13 @@ jobs:
       GH_TOKEN: ${{ secrets.GAME_DATA_TOKEN }}
       TAG: ios-${{ github.run_number }}
       MOLTENVK_VERSION: v1.4.2 # (v1.2.11 has no release files)
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      # Compiler cache (ccache): kept in the PRIVATE data repository (release "build-cache"), never here.
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: true
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+      CCACHE_MAXSIZE: 1500M
     steps:
       - name: Check the data repository
         run: |
@@ -61,7 +69,44 @@ jobs:
           xcodebuild -version
           brew list ninja >/dev/null 2>&1 || brew install ninja
           command -v pwsh || brew install --cask powershell
+          command -v ccache >/dev/null || brew install ccache >/dev/null
+          command -v zstd >/dev/null || brew install zstd >/dev/null
           cmake --version | head -1
+          ccache --version | head -1
+
+      # Builds reuse what did not change (about 8 min -> 3 min). Everything made from the game (the
+      # generated code and the compiled objects) is kept as assets of the PRIVATE data repository's
+      # release "build-cache", never in this public repository's caches.
+      - name: Reuse earlier builds (private data repository)
+        id: caches
+        run: |
+          gh release view build-cache --repo "$DATA_REPO" >/dev/null 2>&1 ||
+            gh release create build-cache --repo "$DATA_REPO" --title "Build cache" \
+              --notes "Generated game code and compiled objects reused by the iOS builds. Private: made from your game files." >/dev/null
+          # The generated code depends only on the game files, the tools, their patches and the config.
+          key=$( { shasum -a 1 "$RUNNER_TEMP/gamedata/default.xex" "$RUNNER_TEMP/gamedata/shader.arc" | cut -d' ' -f1
+                   git ls-tree HEAD tools/XenonRecomp tools/XenosRecomp
+                   cat patches/XenonRecomp-deadrising.patch patches/XenosRecomp-deadrising.patch scripts/ios/codegen.sh scripts/unarc.ps1 xfb2xenos/main.cpp
+                   find config -type f | LC_ALL=C sort | xargs cat; } | shasum -a 256 | cut -c1-16 )
+          echo "CODEGEN_KEY=$key" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/cache" "$RUNNER_TEMP/ccache"
+          if gh release download build-cache --repo "$DATA_REPO" -p "codegen-$key.tar.zst" -D "$RUNNER_TEMP/cache" --clobber 2>/dev/null &&
+             zstd -dc -q "$RUNNER_TEMP/cache/codegen-$key.tar.zst" | tar -xf -; then
+            echo "codegen=hit" >> "$GITHUB_OUTPUT"
+            echo "generated game code: reused ($key)"
+          else
+            echo "codegen=miss" >> "$GITHUB_OUTPUT"
+            echo "generated game code: made this time ($key)"
+          fi
+          if gh release download build-cache --repo "$DATA_REPO" -p ccache.tar -D "$RUNNER_TEMP/cache" --clobber 2>/dev/null; then
+            tar -xf "$RUNNER_TEMP/cache/ccache.tar" -C "$RUNNER_TEMP/ccache"
+            echo "compiler cache: $(du -sh "$RUNNER_TEMP/ccache" | cut -f1)"
+          else
+            echo "compiler cache: empty (first build)"
+          fi
+          rm -rf "$RUNNER_TEMP/cache"
+          ccache -z >/dev/null
 
       - name: MoltenVK (Vulkan on Metal)
         run: |
@@ -72,8 +117,20 @@ jobs:
           echo "MOLTENVK_FRAMEWORK=$fw" >> "$GITHUB_ENV"
           echo "MoltenVK: $fw"
 
+      # FFmpeg holds nothing from the game: this repository's own cache keeps it.
+      - name: FFmpeg from earlier builds
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-ios
+          key: ffmpeg-n7.1-ios16-arm64-${{ hashFiles('scripts/ffmpeg/configure.sh') }}
+
       - name: FFmpeg (XMA audio decoder only)
         run: |
+          echo "FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-ios" >> "$GITHUB_ENV"
+          if [ "${{ steps.ffmpeg-cache.outputs.cache-hit }}" = "true" ] && ls "$RUNNER_TEMP/ffmpeg-ios/lib/"*.a >/dev/null 2>&1; then
+            echo "FFmpeg: reused"; ls "$RUNNER_TEMP/ffmpeg-ios/lib"; exit 0
+          fi
           git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git "$RUNNER_TEMP/ffmpeg"
           sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
           sh scripts/ffmpeg/configure.sh "$RUNNER_TEMP/ffmpeg" "$RUNNER_TEMP/ffmpeg-build" \
@@ -83,13 +140,14 @@ jobs:
           make -C "$RUNNER_TEMP/ffmpeg-build" -j"$(sysctl -n hw.ncpu)" install > "$RUNNER_TEMP/ffmpeg-make.log" 2>&1 ||
             { tail -40 "$RUNNER_TEMP/ffmpeg-make.log"; exit 1; }
           ls -l "$RUNNER_TEMP/ffmpeg-ios/lib"
-          echo "FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-ios" >> "$GITHUB_ENV"
 
       - name: Generate the game code and shaders (from your files)
         run: |
           log="$RUNNER_TEMP/codegen.log"
           set +e
-          bash scripts/ios/codegen.sh "$RUNNER_TEMP/gamedata/default.xex" "$RUNNER_TEMP/gamedata/shader.arc" > "$log" 2>&1
+          # Reused (steps.caches): only the tools' patches are applied (the runtime builds against them).
+          DR_CODEGEN_PATCH_ONLY=${{ steps.caches.outputs.codegen == 'hit' && '1' || '0' }} \
+            bash scripts/ios/codegen.sh "$RUNNER_TEMP/gamedata/default.xex" "$RUNNER_TEMP/gamedata/shader.arc" > "$log" 2>&1
           status=$?
           set -e
           mkdir -p "$RUNNER_TEMP/out" && cp "$log" "$RUNNER_TEMP/out/codegen-${{ github.run_number }}.log"
@@ -106,6 +164,9 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="-Xclang -fno-pch-timestamp" \
             -DDR_MOLTENVK_FRAMEWORK="$MOLTENVK_FRAMEWORK" \
             -DDR_FFMPEG_DIR="$FFMPEG_DIR" \
             -DDR_SHADER_CACHE="$PWD/analysis/shader_cache/shader_cache.cpp" \
@@ -163,3 +224,31 @@ jobs:
           done
           gh release view "$TAG" --repo "$DATA_REPO" >/dev/null
           echo "Delivered to the private repository: release $TAG"
+
+      # After the IPA is delivered: what this build made, for the next one (private data repository).
+      - name: Keep the generated code for the next build (private data repository)
+        if: always() && steps.caches.outputs.codegen == 'miss'
+        run: |
+          test -s analysis/shader_cache/shader_cache.cpp && ls ppc/*.cpp >/dev/null 2>&1 || { echo "nothing generated: not kept"; exit 0; }
+          file="$RUNNER_TEMP/codegen-$CODEGEN_KEY.tar.zst"
+          tar -cf - ppc analysis/shader_cache analysis/shaders_2008/shader_keys.cpp | zstd -T0 -10 -q -o "$file"
+          echo "generated code: $(du -h "$file" | cut -f1)"
+          for old in $(gh release view build-cache --repo "$DATA_REPO" --json assets --jq '.assets[].name | select(startswith("codegen-"))'); do
+            gh release delete-asset build-cache "$old" --repo "$DATA_REPO" -y >/dev/null || true
+          done
+          for attempt in 1 2 3; do
+            gh release upload build-cache "$file" --repo "$DATA_REPO" --clobber && break
+            sleep $((attempt * 10))
+          done
+
+      - name: Keep the compiler cache for the next build (private data repository)
+        if: always() && steps.build.outcome != 'skipped'
+        run: |
+          ccache -s | grep -E -i "hits|misses|cache size" || true
+          ccache --evict-older-than 21d >/dev/null 2>&1 || true
+          tar -cf "$RUNNER_TEMP/ccache.tar" -C "$CCACHE_DIR" .
+          echo "compiler cache: $(du -h "$RUNNER_TEMP/ccache.tar" | cut -f1)"
+          for attempt in 1 2 3; do
+            gh release upload build-cache "$RUNNER_TEMP/ccache.tar" --repo "$DATA_REPO" --clobber && break
+            sleep $((attempt * 10))
+          done
