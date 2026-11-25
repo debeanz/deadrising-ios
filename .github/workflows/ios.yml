@@ -27,7 +27,7 @@ jobs:
       DATA_REPO: ${{ vars.GAME_DATA_REPO }}
       GH_TOKEN: ${{ secrets.GAME_DATA_TOKEN }}
       TAG: ios-${{ github.run_number }}
-      MOLTENVK_VERSION: v1.2.11
+      MOLTENVK_VERSION: v1.4.2 # (v1.2.11 has no release files)
     steps:
       - name: Check the data repository
         run: |
@@ -65,7 +65,7 @@ jobs:
 
       - name: MoltenVK (Vulkan on Metal)
         run: |
-          curl -sSL -o "$RUNNER_TEMP/moltenvk.tar" "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-ios.tar"
+          curl -fsSL -o "$RUNNER_TEMP/moltenvk.tar" "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-ios.tar"
           mkdir -p "$RUNNER_TEMP/moltenvk" && tar -xf "$RUNNER_TEMP/moltenvk.tar" -C "$RUNNER_TEMP/moltenvk"
           fw=$(find "$RUNNER_TEMP/moltenvk" -path "*dynamic*" -path "*ios-arm64/MoltenVK.framework" -type d | grep -v simulator | head -1)
           test -n "$fw" || { echo "::error::MoltenVK.framework (dynamic, ios-arm64) not found"; find "$RUNNER_TEMP/moltenvk" -maxdepth 5 -type d | head -50; exit 1; }
