@@ -145,8 +145,9 @@ target_compile_options(DRRecomp PRIVATE -Wno-unused-variable -Wno-unused-functio
 # (include/, lib/ with libavcodec and libavutil). Without it the game runs silent.
 set(DR_FFMPEG_DIR "" CACHE PATH "FFmpeg build with the XMA2 decoder (include/, lib/)")
 if (DR_FFMPEG_DIR)
-    find_library(DR_AVCODEC NAMES avcodec libavcodec PATHS "${DR_FFMPEG_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
-    find_library(DR_AVUTIL NAMES avutil libavutil PATHS "${DR_FFMPEG_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+    # NO_CMAKE_FIND_ROOT_PATH: cross-compiling for iOS, CMake would look for the path inside the SDK.
+    find_library(DR_AVCODEC NAMES avcodec libavcodec PATHS "${DR_FFMPEG_DIR}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+    find_library(DR_AVUTIL NAMES avutil libavutil PATHS "${DR_FFMPEG_DIR}/lib" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH REQUIRED)
     target_include_directories(DRRecomp PRIVATE "${DR_FFMPEG_DIR}/include")
     target_link_libraries(DRRecomp PRIVATE ${DR_AVCODEC} ${DR_AVUTIL})
     if (WIN32)
