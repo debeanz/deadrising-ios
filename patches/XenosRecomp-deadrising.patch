@@ -470,7 +470,7 @@ index 1c74034..c21166f 100644
  
  float4 tfetchR11G11B10(uint4 value)
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..844d587 100644
+index 698a418..ddcd089 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -89,11 +89,13 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
@@ -679,7 +679,39 @@ index 698a418..844d587 100644
                  if (findResult != float4Constants.end())
                  {
                      const char* constantName = reinterpret_cast<const char*>(constantTableData + findResult->second->name);
-@@ -949,7 +1075,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -625,9 +751,12 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+             default:
+             {
++                // Dead Rising: an export to a register no interpolator is declared for is dropped
++                // (shader BC5959C2398AF923). Reading end() here gave an empty name on Windows by
++                // luck and crashed the translator on macOS (iOS build, 2026-11-25).
+                 auto findResult = interpolators.find(instr.vectorDest);
+-                assert(findResult != interpolators.end());
+-                exportRegister = findResult->second;
++                if (findResult != interpolators.end())
++                    exportRegister = findResult->second;
+                 break;
+             }
+             }
+@@ -667,7 +796,15 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     if (instr.exportData)
+         vectorWriteMask &= ~instr.scalarWriteMask;
+ 
+-    if (vectorWriteMask != 0)
++    // An export with no output to go to (see above) writes nothing; it must not land in r<n>.
++    const bool dropExport = instr.exportData && exportRegister.empty();
++    if (dropExport && (instr.vectorWriteMask | instr.scalarWriteMask) != 0)
++    {
++        indent();
++        println("// export to register {} dropped (no output for it)", uint32_t(instr.vectorDest));
++    }
++
++    if (vectorWriteMask != 0 && !dropExport)
+     {
+         indent();
+         if (!exportRegister.empty())
+@@ -949,7 +1086,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              break;
  
          case AluScalarOpcode::SetpInv:
@@ -691,7 +723,25 @@ index 698a418..844d587 100644
              break;
  
          case AluScalarOpcode::SetpPop:
-@@ -1105,6 +1234,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1034,7 +1174,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     if (instr.exportData)
+         scalarWriteMask &= ~instr.vectorWriteMask;
+ 
+-    if (scalarWriteMask != 0)
++    if (scalarWriteMask != 0 && !dropExport)
+     {
+         indent();
+         if (!exportRegister.empty())
+@@ -1056,7 +1196,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         out += " = ps;\n";
+     }
+ 
+-    if (instr.exportData)
++    if (instr.exportData && !exportRegister.empty())
+     {
+         uint32_t zeroMask = instr.scalarDestRelative ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
+         uint32_t oneMask = instr.vectorWriteMask & instr.scalarWriteMask;
+@@ -1105,6 +1245,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
      assert(shaderContainer->constantTableOffset != NULL);
  
@@ -702,7 +752,7 @@ index 698a418..844d587 100644
      out += include;
      out += '\n';
  
-@@ -1171,14 +1304,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1171,14 +1315,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          case RegisterSet::Sampler:
          {
@@ -721,7 +771,7 @@ index 698a418..844d587 100644
  
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
-@@ -1233,11 +1368,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1233,11 +1379,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
              {
                  println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
@@ -735,7 +785,7 @@ index 698a418..844d587 100644
          }
      }
  
-@@ -1288,6 +1423,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1288,6 +1434,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "#endif\n";
  
          auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
@@ -743,7 +793,7 @@ index 698a418..844d587 100644
          if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
              out += ",\n\tout float4 oC0 : SV_Target0";
          if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
-@@ -1347,7 +1483,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1347,7 +1494,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      #endif
  
@@ -755,7 +805,7 @@ index 698a418..844d587 100644
  
          for (auto& [usage, usageIndex] : INTERPOLATORS)
              print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
-@@ -1383,6 +1522,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1383,6 +1533,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
                      definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
@@ -763,7 +813,7 @@ index 698a418..844d587 100644
  
                  value += 4;
              }
-@@ -1418,7 +1558,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1418,7 +1569,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\n";
      }
  
@@ -788,7 +838,7 @@ index 698a418..844d587 100644
  
      uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
  
-@@ -1457,14 +1613,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1457,14 +1624,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          out += "\n";
      }
  
@@ -813,7 +863,7 @@ index 698a418..844d587 100644
              }
          #ifdef UNLEASHED_RECOMP
              else if (!isPixelShader && hasIndexCount && i == 0)
-@@ -1482,7 +1645,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1482,7 +1656,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
      out += "\tbool p0 = false;\n";
@@ -825,7 +875,7 @@ index 698a418..844d587 100644
      if (isPixelShader)
      {
  #ifdef UNLEASHED_RECOMP
-@@ -1612,6 +1778,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1612,6 +1789,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              uint32_t sequence = 0;
              bool shouldReturn = false;
              bool shouldCloseCurlyBracket = false;
@@ -833,7 +883,7 @@ index 698a418..844d587 100644
  
              switch (cfInstr.opcode)
              {
-@@ -1630,7 +1797,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1630,7 +1808,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  address = cfInstr.condExec.address;
                  count = cfInstr.condExec.count;
                  sequence = cfInstr.condExec.sequence;
@@ -850,7 +900,7 @@ index 698a418..844d587 100644
                  break;
  
              case ControlFlowOpcode::CondExecPred:
-@@ -1639,6 +1814,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1639,6 +1825,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  count = cfInstr.condExecPred.count;
                  sequence = cfInstr.condExecPred.sequence;
                  shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecPredEnd);
@@ -859,7 +909,7 @@ index 698a418..844d587 100644
                  break;
  
              case ControlFlowOpcode::LoopStart:
-@@ -1694,7 +1871,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1694,7 +1882,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      }
                      else
                      {
@@ -868,7 +918,7 @@ index 698a418..844d587 100644
                          if (findResult != boolConstants.end())
                              println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
                          else
-@@ -1720,7 +1897,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1720,7 +1908,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
  
              auto instructionCode = code + address * 3;
@@ -886,7 +936,7 @@ index 698a418..844d587 100644
              for (uint32_t i = 0; i < count; i++)
              {
                  union
-@@ -1792,6 +1978,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,6 +1989,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  instructionCode += 3;
              }
  
@@ -900,7 +950,7 @@ index 698a418..844d587 100644
              if (shouldReturn)
              {
                  if (isPixelShader)
-@@ -1809,6 +2002,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1809,6 +2013,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      indent();
                      out += "}";
  
@@ -927,7 +977,7 @@ index 698a418..844d587 100644
                  #ifdef UNLEASHED_RECOMP
                      specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
  
-@@ -1834,6 +2047,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1834,6 +2058,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      {
                          out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      }
