@@ -16,6 +16,7 @@ void DumpPlayerTrace(); // gpu/d3d_hooks.cpp: Frank's held item trace
 #include <apu/xma.h>
 #include <user/config.h>
 #include <os/logger.h>
+#include <os/stderr_capture.h>
 #include <dr_shims.h>
 #include <file.h>
 #include <image.h>
@@ -470,6 +471,7 @@ static int DRMain(int argc, char* argv[])
 
     os::logger::Init();
     LOGN("Dead Rising recomp runtime");
+    StderrCapture::Start(); // Apple: MoltenVK's and plume's messages into the log ("[stderr]")
 
     // Game folder: first argument, otherwise the folder that holds default.xex next to us.
     std::filesystem::path gamePath = argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::current_path();

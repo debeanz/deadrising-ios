@@ -4135,7 +4135,15 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
 
         pipeline = g_device->createGraphicsPipeline(desc);
         if (pipeline == nullptr)
+        {
+            // Its draws are skipped. On iOS MoltenVK says why just before ("[stderr]" lines, os/stderr_capture.cpp).
             g_pipelinesFailed++;
+            static std::atomic<uint32_t> logged{ 0 };
+            if (logged++ < 50)
+                LOGFN_WARNING("[renderer] pipeline not made (draws skipped): VS {:016X} PS {:016X}, colour format {}, {} samples, topology {}, spec constants {:X}",
+                    key.vertexShader ? key.vertexShader->hash : 0, key.pixelShader ? key.pixelShader->hash : 0, int(key.colorFormat), key.samples,
+                    int(key.topology), key.specConstants);
+        }
         return pipeline;
     }
 
@@ -4330,6 +4338,8 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
     // host's reversed-Z mirror so the game's shaders read the depth values they expect.
     void ReplayDepthResolve(RenderCommandList* list, const Command& cmd, HostTarget& target, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
     {
+        if (g_depthPipeline == nullptr) // not made (Renderer::Init logs it)
+            return;
         DepthBuffer& depth = *target.depth;
         x1 = std::min(x1, int32_t(depth.width));
         y1 = std::min(y1, int32_t(depth.height));
@@ -4478,6 +4488,8 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
     // console would copy (as 16-bit unorm), which the game's shaders decode themselves.
     void ReplayEncodeResolve(RenderCommandList* list, const Command& cmd, HostTarget& target, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
     {
+        if (g_encodePipeline == nullptr) // not made (Renderer::Init logs it)
+            return;
         const int32_t width = std::min(x1 - x0, int32_t(cmd.destWidth) - cmd.destX);
         const int32_t height = std::min(y1 - y0, int32_t(cmd.destHeight) - cmd.destY);
         if (width <= 0 || height <= 0 || cmd.destX < 0 || cmd.destY < 0)
@@ -5549,6 +5561,11 @@ bool Renderer::Init(RenderDevice* device, bool vulkan, RenderFormat backBufferFo
         desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
         g_menuPipeline = device->createGraphicsPipeline(desc);
     }
+    if ((g_depthPixelShader != nullptr && g_depthPipeline == nullptr) || (g_depthMsaaPixelShader != nullptr && g_depthMsaaPipeline == nullptr) ||
+        (g_encodePixelShader != nullptr && g_encodePipeline == nullptr) || (g_overlayPixelShader != nullptr && g_overlayPipeline == nullptr) ||
+        (g_menuPixelShader != nullptr && g_menuPipeline == nullptr))
+        LOGFN_WARNING("[renderer] pipelines not made: depth {}, depth MSAA {}, encode {}, overlay {}, menu {} (those passes are skipped)",
+            g_depthPipeline == nullptr, g_depthMsaaPipeline == nullptr, g_encodePipeline == nullptr, g_overlayPipeline == nullptr, g_menuPipeline == nullptr);
     if (g_blitPipeline == nullptr)
     {
         LOGN_ERROR("[renderer] blit pipeline could not be created");

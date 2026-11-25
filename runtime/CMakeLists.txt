@@ -137,6 +137,7 @@ set(DR_RUNTIME_SOURCES
     src/profiler/cpu_sampler.cpp
     src/os/hang_watchdog.cpp
     src/os/memory_info.cpp
+    src/os/stderr_capture.cpp
 )
 list(APPEND DR_RUNTIME_SOURCES src/os/logger_win32.cpp) # stdio: portable despite the name
 

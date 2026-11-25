@@ -21,7 +21,7 @@ index 6e9619d..8657c4b 100644
          const D3D12PipelineLayout *pipelineLayout = static_cast<const D3D12PipelineLayout *>(desc.pipelineLayout);
          const D3D12Shader *vertexShader = static_cast<const D3D12Shader *>(desc.vertexShader);
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 194ed7f..30e14ed 100644
+index 194ed7f..8acde6d 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -13,6 +13,9 @@
@@ -162,7 +162,29 @@ index 194ed7f..30e14ed 100644
      }
  
      VulkanDevice::~VulkanDevice() {
-@@ -4418,6 +4503,11 @@ namespace plume {
+@@ -4156,11 +4241,19 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createComputePipeline(const RenderComputePipelineDesc &desc) {
+-        return std::make_unique<VulkanComputePipeline>(this, desc);
++        // Dead Rising: nullptr when the driver could not make it (MoltenVK crashed binding a null VkPipeline).
++        auto pipeline = std::make_unique<VulkanComputePipeline>(this, desc);
++        if (pipeline->vk == VK_NULL_HANDLE)
++            return nullptr;
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
+-        return std::make_unique<VulkanGraphicsPipeline>(this, desc);
++        // Dead Rising: nullptr when the driver could not make it (MoltenVK crashed binding a null VkPipeline).
++        auto pipeline = std::make_unique<VulkanGraphicsPipeline>(this, desc);
++        if (pipeline->vk == VK_NULL_HANDLE)
++            return nullptr;
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
+@@ -4418,6 +4511,11 @@ namespace plume {
              allocator = VK_NULL_HANDLE;
          }
  
@@ -174,7 +196,7 @@ index 194ed7f..30e14ed 100644
          if (vk != VK_NULL_HANDLE) {
              vkDestroyDevice(vk, nullptr);
              vk = VK_NULL_HANDLE;
-@@ -4446,6 +4536,25 @@ namespace plume {
+@@ -4446,6 +4544,25 @@ namespace plume {
      VulkanInterface::VulkanInterface() {
  #endif
          VkResult res = volkInitialize();
