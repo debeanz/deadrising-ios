@@ -504,6 +504,7 @@ void CpuSampler::LogStack(const void* context)
 }
 #elif defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <cxxabi.h>
