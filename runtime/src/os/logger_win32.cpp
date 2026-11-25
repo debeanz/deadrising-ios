@@ -5,6 +5,8 @@
 
 static std::mutex g_logMutex;
 static FILE* g_logFile;
+static std::string g_recent[64]; // ring of the last lines (RecentLines)
+static size_t g_recentCount = 0;
 
 void os::logger::Init()
 {
@@ -27,4 +29,17 @@ void os::logger::Log(const std::string_view str, ELogType type, const char* func
         fputs(line.c_str(), g_logFile);
         fflush(g_logFile);
     }
+
+    line.pop_back(); // the newline
+    g_recent[g_recentCount++ % 64] = std::move(line);
+}
+
+std::vector<std::string> os::logger::RecentLines(size_t count)
+{
+    std::lock_guard lock(g_logMutex);
+    count = std::min({ count, g_recentCount, size_t(64) });
+    std::vector<std::string> lines;
+    for (size_t i = g_recentCount - count; i < g_recentCount; i++)
+        lines.push_back(g_recent[i % 64]);
+    return lines;
 }

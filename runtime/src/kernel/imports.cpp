@@ -3,6 +3,7 @@
 #include <cpu/guest_thread.h>
 #include <dr_shims.h>
 #include "function.h"
+#include "park.h"
 #include "xex.h"
 #include "xbox.h"
 #include "heap.h"
@@ -55,7 +56,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         {
             if (manualReset)
             {
-                signaled.wait(false);
+                Park::WaitWhile(&signaled, [&] { return !signaled.load(); });
             }
             else
             {
@@ -65,7 +66,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
                     if (signaled.compare_exchange_weak(expected, false))
                         break;
 
-                    signaled.wait(expected);
+                    Park::WaitWhile(&signaled, [&] { return !signaled.load(); });
                 }
             }
         }
@@ -87,11 +88,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
     bool Set()
     {
         signaled = true;
-
-        if (manualReset)
-            signaled.notify_all();
-        else
-            signaled.notify_one();
+        Park::Wake(&signaled); // kernel/park.h (was notify_one / notify_all)
 
         return TRUE;
     }
@@ -146,7 +143,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
                 }
                 else
                 {
-                    count.wait(0);
+                    Park::WaitWhile(&count, [&] { return count.load() == 0; });
                 }
             }
 
@@ -173,7 +170,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         assert(count + releaseCount <= maximumCount);
 
         count += releaseCount;
-        count.notify_all();
+        Park::Wake(&count);
     }
 };
 
@@ -677,7 +674,7 @@ uint32_t NtSuspendThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE) && hThread->GetThreadId() == GuestThread::GetCurrentThreadId());
 
     hThread->suspended = true;
-    hThread->suspended.wait(true);
+    Park::WaitWhile(&hThread->suspended, [&] { return hThread->suspended.load(); });
 
     return S_OK;
 }
@@ -786,7 +783,8 @@ void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
     std::atomic_ref owningThread(cs->OwningThread);
     OnRelease(cs);
     owningThread.store(0);
-    owningThread.notify_one();
+    if (LockWaiters(cs).load() > 0) // (a waiter counts itself before it checks the owner: kernel/park.h)
+        Park::Wake(cs);
 }
 
 void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
@@ -815,7 +813,7 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
             waiting = true;
             StartWaiting(cs);
         }
-        owningThread.wait(previousOwner);
+        Park::WaitWhile(cs, [&] { return owningThread.load() == previousOwner; });
     }
 }
 
@@ -1118,7 +1116,7 @@ bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
     bool result = QueryKernelObject<Event>(*pEvent)->Set();
 
     ++g_keSetEventGeneration;
-    g_keSetEventGeneration.notify_all();
+    Park::Wake(&g_keSetEventGeneration);
 
     return result;
 }
@@ -1434,7 +1432,7 @@ uint32_t NtResumeThread(GuestThreadHandle* hThread, uint32_t* suspendCount)
     assert(hThread != GetKernelObject(CURRENT_THREAD_HANDLE));
 
     hThread->suspended = false;
-    hThread->suspended.notify_all();
+    Park::Wake(&hThread->suspended);
 
     return S_OK;
 }
@@ -1646,7 +1644,7 @@ uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HEADER>* 
                 }
             }
 
-            g_keSetEventGeneration.wait(generation);
+            Park::WaitWhile(&g_keSetEventGeneration, [&] { return g_keSetEventGeneration.load() == generation; });
         }
     }
 
@@ -1683,7 +1681,7 @@ uint32_t KeResumeThread(GuestThreadHandle* object)
     assert(object != GetKernelObject(CURRENT_THREAD_HANDLE));
 
     object->suspended = false;
-    object->suspended.notify_all();
+    Park::Wake(&object->suspended);
     return 0;
 }
 

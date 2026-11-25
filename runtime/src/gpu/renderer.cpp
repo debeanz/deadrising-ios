@@ -3200,6 +3200,19 @@ void Renderer::OnPresent(uint32_t device)
         t_watched = true;
         CpuSampler::WatchHitches(); // "[hitch profile]" for frames with over 50 ms of game work (DR_HITCH_PROFILE=0 off)
     }
+    // DR_TEST_STALL=<frame>:<seconds> holds the game thread at that present (tests the status panel
+    // and the hang watchdog; frame 1: before the first picture reaches the window).
+    static const std::pair<uint32_t, uint32_t> testStall = [] {
+        const char* value = getenv("DR_TEST_STALL");
+        if (value == nullptr || strchr(value, ':') == nullptr)
+            return std::make_pair(0u, 0u);
+        return std::make_pair(uint32_t(atoi(value)), uint32_t(atoi(strchr(value, ':') + 1)));
+    }();
+    if (testStall.second != 0 && g_guestFrame + 1 == testStall.first)
+    {
+        LOGFN("[test] holding the game for {} s at frame {} (DR_TEST_STALL)", testStall.second, testStall.first);
+        std::this_thread::sleep_for(std::chrono::seconds(testStall.second));
+    }
     HangWatchdog::OnPresent();
     const auto presentStart = std::chrono::steady_clock::now();
     static auto lastPresent = presentStart;
@@ -5719,9 +5732,17 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
         shownWidth = g_shownTarget->width;
         shownHeight = g_shownTarget->height;
     }
-    else
+    bool havePicture = true;
+    if (shownDescriptor == 0 && g_shownTarget == nullptr && g_shownResolve == nullptr &&
+        (g_showFinal || g_sceneSnapshot.texture == nullptr))
     {
-        return false;
+        // No picture from the game yet: black, with the touch controls and the options menu or
+        // the status panel (ui/options_menu.cpp) over it, so the screen is never just black.
+        if (!OptionsMenu::Visible())
+            return false;
+        havePicture = false;
+        shownWidth = 1280;
+        shownHeight = 720;
     }
 
     // The blit reads its texture index (and the FXAA switch) from the "shared constants" slot.
@@ -5777,7 +5798,12 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
     const float scale = std::min(float(width) / float(shownWidth), float(height) / float(shownHeight));
     const float shownW = std::round(float(shownWidth) * scale), shownH = std::round(float(shownHeight) * scale);
     g_gpuProfile.Mark(list, "final blit to the window");
-    if (shownW < float(width) - 0.5f || shownH < float(height) - 0.5f)
+    if (!havePicture)
+    {
+        list->setViewports(&viewport, 1);
+        list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+    }
+    else if (shownW < float(width) - 0.5f || shownH < float(height) - 0.5f)
     {
         list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
         RenderViewport image(std::floor((float(width) - shownW) * 0.5f), std::floor((float(height) - shownH) * 0.5f), shownW, shownH);
@@ -5785,10 +5811,13 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
     }
     else
         list->setViewports(&viewport, 1);
-    list->setPipeline(g_blitPipeline.get());
-    BindLayout(list);
-    SetRootDescriptor(list, uint32_t(blitOffset), 2);
-    list->drawInstanced(3, 1, 0, 0);
+    if (havePicture)
+    {
+        list->setPipeline(g_blitPipeline.get());
+        BindLayout(list);
+        SetRootDescriptor(list, uint32_t(blitOffset), 2);
+        list->drawInstanced(3, 1, 0, 0);
+    }
 
     // Dumps: the image as shown (FXAA included), from the same blit into an offscreen copy.
     // DR_SHOT=<step>[:<first>-<last>] writes only this image, every <step> frames.
@@ -5808,7 +5837,7 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
     }();
     (void)shotParsed;
     const bool shot = shotStep != 0 && g_frameIndex >= shotFirst && g_frameIndex <= shotLast && (g_frameIndex - shotFirst) % shotStep == 0;
-    if (g_dumpingFrame || shot)
+    if ((g_dumpingFrame || shot) && havePicture)
     {
         static std::unique_ptr<RenderTexture> shownTexture;
         static std::unique_ptr<RenderFramebuffer> shownFramebuffer;

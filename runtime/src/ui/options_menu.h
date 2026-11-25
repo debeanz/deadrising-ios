@@ -7,6 +7,7 @@
 // Escape, F1 or Start + Back again closes it (and saves recomp_config.toml).
 
 #include <cstdint>
+#include <string>
 
 union SDL_Event;
 
@@ -20,4 +21,7 @@ namespace OptionsMenu
     uint16_t FilterButtons(uint16_t raw);
     // The menu image (RGBA8, straight alpha, width x height); version changes whenever it does.
     const uint8_t* Image(uint32_t& width, uint32_t& height, uint32_t& version);
+    // Video thread: the status panel shown while the game gives no picture (headline and the latest
+    // log lines); an empty headline hides it.
+    void SetStatus(const std::string& headline);
 }

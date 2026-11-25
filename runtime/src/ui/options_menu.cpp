@@ -36,6 +36,7 @@ namespace
     std::vector<uint8_t> g_image(size_t(kWidth) * kHeight * 4);
     uint32_t g_version = 0;
     bool g_open = false;
+    std::string g_status; // SetStatus: the panel shown while the game gives no picture
     double g_fps = 0.0;          // last measured by the video loop (SetFps)
     int g_shownFps = -1;
     bool g_waitRelease = false; // closed: the game gets input back once everything is released
@@ -128,10 +129,34 @@ namespace
         Glyphs(x, y, scale, text, r, g, b);
     }
 
+    // While the game gives no picture (starting, or stuck): what is going on, and the log's last
+    // lines, so the screen is never just black (2026-11-25, the iPhone build).
+    void DrawStatus()
+    {
+        Fill(0, 0, kWidth, kHeight, 8, 10, 14, 235);
+        Text(24, 18, 2, "Dead Rising (recompiled)", 255, 235, 80);
+        Text(24, 54, 1, g_status, 255, 170, 90);
+#if defined(__APPLE__)
+        Text(24, 74, 1, "Full log: Files > On My iPhone > Dead Rising > DRRecomp.log. Options: Start + Back.", 150, 150, 150);
+#else
+        Text(24, 74, 1, "Full log: DRRecomp.log next to the game. Options: F1 or Start + Back.", 150, 150, 150);
+#endif
+        int y = 104;
+        for (std::string line : os::logger::RecentLines(36))
+        {
+            if (line.size() > 156)
+                line = line.substr(0, 153) + "...";
+            Text(24, y, 1, line, 200, 200, 200);
+            y += 17;
+        }
+    }
+
     void Redraw()
     {
         std::fill(g_image.begin(), g_image.end(), uint8_t(0));
-        if (Config::ShowFps)
+        if (!g_status.empty() && !g_open)
+            DrawStatus();
+        if (Config::ShowFps && (g_status.empty() || g_open)) // not over the status panel's title
         {
             // Frame counter, top left (also while the menu is open).
             const std::string fps = g_shownFps < 0 ? std::string("-- FPS") : std::to_string(g_shownFps) + " FPS";
@@ -296,9 +321,17 @@ void OptionsMenu::Update()
         Redraw();
 }
 
+void OptionsMenu::SetStatus(const std::string& headline)
+{
+    if (headline.empty() && g_status.empty())
+        return;
+    g_status = headline;
+    Redraw(); // the log lines change too
+}
+
 bool OptionsMenu::Visible()
 {
-    return g_open || Config::ShowFps;
+    return g_open || Config::ShowFps || !g_status.empty();
 }
 
 const uint8_t* OptionsMenu::Image(uint32_t& width, uint32_t& height, uint32_t& version)

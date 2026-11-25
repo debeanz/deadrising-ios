@@ -438,14 +438,43 @@ namespace
             MarkStage(StageInput);
 
             Video::FrameStats stats;
+            bool gameFrame = false;
             {
                 std::unique_lock lock(g_frameMutex);
                 g_frameReady.wait_for(lock, std::chrono::milliseconds(50), [] { return g_framePending; });
                 g_stageMark = std::chrono::steady_clock::now(); // waiting for the game is not this thread's time
-                if (!g_framePending)
+                if (g_framePending)
+                {
+                    stats = g_pendingStats;
+                    g_framePending = false;
+                    gameFrame = true;
+                }
+            }
+
+            // No picture from the game for 2 s (starting, a long load, or stuck): the status panel
+            // (ui/options_menu.cpp: what is happening and the log's last lines) over the last picture
+            // or black, 5 times a second, with the touch controls and the options menu working. The
+            // iPhone build showed nothing at all while the game hung before its first frame.
+            static auto lastGameFrame = std::chrono::steady_clock::now();
+            static auto lastStatusFrame = lastGameFrame;
+            static Video::FrameStats lastStats;
+            const auto loopNow = std::chrono::steady_clock::now();
+            if (gameFrame)
+            {
+                lastGameFrame = loopNow;
+                lastStats = stats;
+                OptionsMenu::SetStatus({});
+            }
+            else
+            {
+                const double waited = std::chrono::duration<double>(loopNow - lastGameFrame).count();
+                if (waited < 2.0 || loopNow - lastStatusFrame < std::chrono::milliseconds(200))
                     continue; // keep the window responsive while the game loads
-                stats = g_pendingStats;
-                g_framePending = false;
+                lastStatusFrame = loopNow;
+                OptionsMenu::SetStatus(fmt::format("{} {:.0f} s", lastStats.frame == 0 ? "The game has not shown a picture yet:" :
+                    "No new picture from the game for", waited));
+                RenderFrame(lastStats);
+                continue;
             }
 
             RenderFrame(stats);

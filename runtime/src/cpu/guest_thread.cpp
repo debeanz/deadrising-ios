@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include <profiler/cpu_sampler.h>
 #include <os/hang_watchdog.h>
+#include <kernel/park.h>
 #include "guest_thread.h"
 #include <kernel/memory.h>
 #include <kernel/heap.h>
@@ -63,7 +64,7 @@ static void* GuestThreadFunc(void* arg)
 static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
 #endif
-    hThread->suspended.wait(true);
+    Park::WaitWhile(&hThread->suspended, [&] { return hThread->suspended.load(); }); // kernel/park.h
     GuestThread::Start(hThread->params);
 #ifdef USE_PTHREAD
     return nullptr;

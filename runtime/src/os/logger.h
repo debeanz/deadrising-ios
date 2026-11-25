@@ -63,4 +63,6 @@ namespace os::logger
 
     void Init();
     void Log(const std::string_view str, ELogType type = ELogType::None, const char* func = nullptr);
+    // The last lines logged (up to 64), oldest first: the status panel (ui/options_menu.cpp).
+    std::vector<std::string> RecentLines(size_t count);
 }
