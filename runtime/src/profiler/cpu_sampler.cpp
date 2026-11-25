@@ -47,9 +47,8 @@ namespace
 
     // Reads a suspended thread's stack: frame 0 is the instruction pointer, the others return
     // addresses (x64 unwind data; a frame without it is a leaf whose return address is at rsp).
-    int WalkStack(CONTEXT ctx, uint64_t* frames)
+    void WalkFrames(CONTEXT& ctx, uint64_t* frames, int& depth)
     {
-        int depth = 0;
         while (depth < kMaxDepth && ctx.Rip > 0x10000)
         {
             frames[depth++] = ctx.Rip;
@@ -66,6 +65,21 @@ namespace
             void* handlerData = nullptr;
             DWORD64 establisher = 0;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, function, &ctx, &handlerData, &establisher, nullptr);
+        }
+    }
+
+    // A thread stopped where a frame is not set up yet (its frame register still holding something else) unwinds
+    // into memory that is not there (2026-11-25: a crash in the hitch profiler, fault at 0x8218FA18): the sample
+    // ends at that frame.
+    int WalkStack(CONTEXT ctx, uint64_t* frames)
+    {
+        int depth = 0;
+        __try
+        {
+            WalkFrames(ctx, frames, depth);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
         }
         return depth;
     }
@@ -494,6 +508,11 @@ void CpuSampler::LogStack(const void* context)
 #include <dlfcn.h>
 #include <cxxabi.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#include <kernel/park.h>
+
+// libproc (not in the iOS SDK's headers; in its libraries since iOS 7).
+extern "C" int proc_pid_rusage(int pid, int flavor, rusage_info_t* buffer);
 
 // Apple (iPhone, iPad): the CPU profile of the threads the frame waits for. A sampler thread stops each watched thread
 // every 2 ms, reads its call stack (frame-pointer chain) and lets it go on; every 10 s it logs, per thread,
@@ -621,6 +640,7 @@ namespace
         const mach_port_t mainThread = g_mainThread;
         std::unordered_map<uint64_t, uint64_t> now;
         std::unordered_map<std::string, std::pair<uint64_t, uint32_t>> byName; // ns, threads
+        std::unordered_map<std::string, int> priorityByName; // the highest scheduling priority (47: QoS user-interactive)
         uint64_t allNs = 0;
         for (mach_msg_type_number_t i = 0; i < count; i++)
         {
@@ -652,6 +672,8 @@ namespace
                 auto& entry = byName[name];
                 entry.first += delta;
                 entry.second++;
+                int& priority = priorityByName[name];
+                priority = std::max(priority, int(info.pth_curpri));
                 allNs += delta;
             }
             mach_port_deallocate(mach_task_self(), list[i]);
@@ -690,9 +712,58 @@ namespace
             lastTaskCpu = taskCpu;
         }
 
+#ifdef RUSAGE_INFO_V6
+        // The same from the process's resource usage: cycles and instructions on the performance cores, and the CPU's
+        // energy in nanojoules (all cores, performance cores).
+        {
+            static rusage_info_v6 lastUsage{};
+            rusage_info_v6 usage{};
+            if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, reinterpret_cast<rusage_info_t*>(&usage)) == 0)
+            {
+                static bool haveLast = false;
+                if (haveLast)
+                {
+                    // ri_runnable_time and the QoS times are in Mach time units.
+                    mach_timebase_info_data_t timebase{};
+                    mach_timebase_info(&timebase);
+                    const double tickNs = timebase.denom != 0 ? double(timebase.numer) / double(timebase.denom) : 1.0;
+                    const double qosAll = double(
+                        (usage.ri_cpu_time_qos_default - lastUsage.ri_cpu_time_qos_default) +
+                        (usage.ri_cpu_time_qos_maintenance - lastUsage.ri_cpu_time_qos_maintenance) +
+                        (usage.ri_cpu_time_qos_background - lastUsage.ri_cpu_time_qos_background) +
+                        (usage.ri_cpu_time_qos_utility - lastUsage.ri_cpu_time_qos_utility) +
+                        (usage.ri_cpu_time_qos_legacy - lastUsage.ri_cpu_time_qos_legacy) +
+                        (usage.ri_cpu_time_qos_user_initiated - lastUsage.ri_cpu_time_qos_user_initiated) +
+                        (usage.ri_cpu_time_qos_user_interactive - lastUsage.ri_cpu_time_qos_user_interactive));
+                    auto qos = [&](uint64_t now, uint64_t before) { return qosAll > 0 ? 100.0 * double(now - before) / qosAll : 0.0; };
+                    task += fmt::format("; CPU time by QoS: user-interactive {:.0f}%, user-initiated {:.0f}%, default {:.0f}%, legacy {:.0f}%, "
+                                        "utility and below {:.0f}%",
+                        qos(usage.ri_cpu_time_qos_user_interactive, lastUsage.ri_cpu_time_qos_user_interactive),
+                        qos(usage.ri_cpu_time_qos_user_initiated, lastUsage.ri_cpu_time_qos_user_initiated),
+                        qos(usage.ri_cpu_time_qos_default, lastUsage.ri_cpu_time_qos_default),
+                        qos(usage.ri_cpu_time_qos_legacy, lastUsage.ri_cpu_time_qos_legacy),
+                        qos(usage.ri_cpu_time_qos_utility + usage.ri_cpu_time_qos_background + usage.ri_cpu_time_qos_maintenance,
+                            lastUsage.ri_cpu_time_qos_utility + lastUsage.ri_cpu_time_qos_background + lastUsage.ri_cpu_time_qos_maintenance));
+                    const double cycles = double(usage.ri_cycles - lastUsage.ri_cycles);
+                    const double instructions = double(usage.ri_instructions - lastUsage.ri_instructions);
+                    task += fmt::format("; rusage: performance cores {:.0f}% of the cycles and {:.0f}% of the instructions, "
+                                        "CPU energy {:.2f} W ({:.2f} W on the performance cores), threads runnable but waiting for a core {:.0f}% of one core",
+                        cycles > 0 ? 100.0 * double(usage.ri_pcycles - lastUsage.ri_pcycles) / cycles : 0.0,
+                        instructions > 0 ? 100.0 * double(usage.ri_pinstructions - lastUsage.ri_pinstructions) / instructions : 0.0,
+                        double(usage.ri_energy_nj - lastUsage.ri_energy_nj) / 1e9 / seconds,
+                        double(usage.ri_penergy_nj - lastUsage.ri_penergy_nj) / 1e9 / seconds,
+                        100.0 * double(usage.ri_runnable_time - lastUsage.ri_runnable_time) * tickNs / (seconds * 1e9));
+                }
+                lastUsage = usage;
+                haveLast = true;
+            }
+        }
+#endif
+        task += fmt::format("; missed wakes {}", Park::MissedWakes().load());
+
         std::vector<std::pair<uint64_t, std::string>> sorted;
         for (const auto& [name, entry] : byName)
-            sorted.emplace_back(entry.first, entry.second > 1 ? fmt::format("{} x{}", name, entry.second) : name);
+            sorted.emplace_back(entry.first, fmt::format("{}{} (pri {})", name, entry.second > 1 ? fmt::format(" x{}", entry.second) : std::string(), priorityByName[name]));
         std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::string text;
         for (size_t i = 0; i < sorted.size() && i < 16; i++)

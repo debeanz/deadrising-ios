@@ -74,16 +74,20 @@ struct Event final : KernelObject, HostObject<XKEVENT>
         {
             // Finite timeout (Dead Rising's D3D thread waits like this): poll until signaled or timed out.
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            // Asleep until signalled (kernel/park.h) or the deadline; it polled every 0.5 ms before (2026-11-25:
+            // the game's D3D thread waits like this; up to 2000 wakeups a second and 0.5 ms late each time).
             while (Wait(0) != STATUS_SUCCESS)
             {
-                if (std::chrono::steady_clock::now() >= deadline)
-                    return STATUS_TIMEOUT;
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                if (!Park::WaitWhileUntil(ParkAddress(), deadline, [&] { return !Ready(); }))
+                    return Wait(0) == STATUS_SUCCESS ? STATUS_SUCCESS : STATUS_TIMEOUT;
             }
         }
 
         return STATUS_SUCCESS;
     }
+
+    const void* ParkAddress() const { return &signaled; }
+    bool Ready() const { return signaled.load(); }
 
     bool Set()
     {
@@ -152,15 +156,19 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
         else
         {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            // Asleep until signalled (kernel/park.h) or the deadline; it polled every 0.5 ms before (2026-11-25:
+            // the game's D3D thread waits like this; up to 2000 wakeups a second and 0.5 ms late each time).
             while (Wait(0) != STATUS_SUCCESS)
             {
-                if (std::chrono::steady_clock::now() >= deadline)
-                    return STATUS_TIMEOUT;
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                if (!Park::WaitWhileUntil(ParkAddress(), deadline, [&] { return !Ready(); }))
+                    return Wait(0) == STATUS_SUCCESS ? STATUS_SUCCESS : STATUS_TIMEOUT;
             }
             return STATUS_SUCCESS;
         }
     }
+
+    const void* ParkAddress() const { return &count; }
+    bool Ready() const { return count.load() != 0; }
 
     void Release(uint32_t releaseCount, uint32_t* previousCount)
     {

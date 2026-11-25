@@ -1054,17 +1054,7 @@ namespace
         void Start()
         {
             std::call_once(started, [this] {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-                // iPhone / iPad: pipelines wait on the Metal compiler (another process) most of their time.
-                const uint32_t threads = std::clamp(std::thread::hardware_concurrency() - 1, 3u, 8u);
-#else
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-                // iPhone / iPad: a pipeline waits on the Metal compiler (another process) most of its time.
-                const uint32_t threads = std::clamp(std::thread::hardware_concurrency() - 1, 3u, 8u);
-#else
                 const uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
-#endif
-#endif
                 for (uint32_t i = 0; i < threads; i++)
                     std::thread([this] { Run(); }).detach();
                 LOGFN("[renderer] {} texture decode threads", threads);
@@ -1074,6 +1064,9 @@ namespace
         void Run()
         {
             HangWatchdog::PrepareThread(); // crash reports, also of a stack overflow
+            // A texture not decoded yet shows white: the fast cores (iPhone: at default QoS these waited behind the game).
+            SetThreadInteractive();
+            NameThisThread("texture decode");
             while (true)
             {
                 DecodeJob* job;
@@ -3727,7 +3720,9 @@ namespace
     struct PipelineSlot
     {
         std::unique_ptr<RenderPipeline> pipeline;
-        bool ready = false; // under g_pipelineMutex
+        bool ready = false;              // under g_pipelineMutex
+        bool fromList = false;           // from the list of earlier runs (LoadPipelineList): draws wait for it
+        std::atomic<bool> claimed{ false }; // a thread is making it (a pool thread, or the video thread itself)
     };
     std::mutex g_pipelineMutex;
     std::condition_variable g_pipelineReady;
@@ -3868,17 +3863,26 @@ namespace
     public:
         explicit WorkerPool(const char* name) : name(name) {}
 
-        void Submit(std::function<void()> job)
+        // 'urgent': a frame waits for it (ahead of the list of earlier runs, made in the background).
+        void Submit(std::function<void()> job, bool urgent = false)
         {
             std::call_once(started, [this] {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                // iPhone / iPad: a pipeline waits on the Metal compiler (another process) much of its time.
+                const uint32_t threads = std::clamp(std::thread::hardware_concurrency() - 2, 3u, 8u);
+#else
                 const uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+#endif
                 for (uint32_t i = 0; i < threads; i++)
                     std::thread([this] { Run(); }).detach();
                 LOGFN("[renderer] {} {} threads", threads, this->name);
             });
             {
                 std::lock_guard lock(mutex);
-                queue.push_back(std::move(job));
+                if (urgent)
+                    queue.push_front(std::move(job));
+                else
+                    queue.push_back(std::move(job));
             }
             work.notify_one();
         }
@@ -3887,6 +3891,9 @@ namespace
         void Run()
         {
             NameThisThread(name); // "[cpu] threads"
+            // The fast cores, and with them the Metal compiler working for this thread: at default QoS the iPhone
+            // took 2-15 s a pipeline while the game kept the cores busy (2026-11-25, the roof), and the draws waited.
+            SetThreadInteractive();
             while (true)
             {
                 std::function<void()> job;
@@ -4160,7 +4167,23 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 if (!slot->ready)
                 {
                     HitchStats::Timer timer(HitchStats::Pipelines);
-                    if (AsyncPipelines())
+                    // From the list of earlier runs: made here if no thread has started it yet, else waited for (a
+                    // pipeline known from before is never skipped: no model missing for a moment).
+                    if (slot->fromList && !slot->claimed.exchange(true))
+                    {
+                        lock.unlock();
+                        std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
+                        {
+                            std::lock_guard relock(g_pipelineMutex);
+                            slot->pipeline = std::move(pipeline);
+                            slot->ready = true;
+                        }
+                        g_pipelineReady.notify_all();
+                        return slot->pipeline.get();
+                    }
+                    if (slot->fromList)
+                        g_pipelineReady.wait(lock, [slot] { return slot->ready; });
+                    else if (AsyncPipelines())
                     {
                         if (!g_pipelineReady.wait_until(lock, g_pipelineDeadline, [slot] { return slot->ready; }))
                         {
@@ -4176,6 +4199,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             }
             entry = std::make_unique<PipelineSlot>();
             slot = entry.get();
+            slot->claimed = true;
         }
         HitchStats::Timer timer(HitchStats::Pipelines);
         std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
@@ -4214,8 +4238,10 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             const PipelineKey key = cmd.key;
             g_perfPipelinesQueued.fetch_add(1, std::memory_order_relaxed);
             g_pipelinePool.Submit([key, slot, hash] {
-                std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
                 g_perfPipelinesQueued.fetch_sub(1, std::memory_order_relaxed);
+                if (slot->claimed.exchange(true))
+                    return;
+                std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
                 if (pipeline != nullptr)
                     RecordPipeline(key, hash);
                 {
@@ -4224,7 +4250,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                     slot->ready = true;
                 }
                 g_pipelineReady.notify_all();
-            });
+            }, true);
         }
     }
 
@@ -4308,12 +4334,15 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                     continue;
                 entry = std::make_unique<PipelineSlot>();
                 slot = entry.get();
+                slot->fromList = true;
             }
             g_recipeDeclarations.push_back(std::move(decl));
             g_perfPipelinesQueued.fetch_add(1, std::memory_order_relaxed);
             g_pipelinePool.Submit([key, slot] {
-                std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
                 g_perfPipelinesQueued.fetch_sub(1, std::memory_order_relaxed);
+                if (slot->claimed.exchange(true))
+                    return; // the video thread needed it first and made it
+                std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
                 {
                     std::lock_guard lock(g_pipelineMutex);
                     slot->pipeline = std::move(pipeline);

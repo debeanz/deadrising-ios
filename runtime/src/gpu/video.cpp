@@ -16,6 +16,7 @@
 #include <os/thread_qos.h>
 #include <os/perf.h>
 #include "command_processor.h"
+#include <kernel/park.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -401,8 +402,9 @@ namespace
         const int thermal = IosGpu::ThermalState();
         device = fmt::format("; device: thermal {}{}", kThermal[std::clamp(thermal, 0, 3)], IosGpu::LowPowerMode() ? ", Low Power Mode on (slower)" : "");
 #endif
-        LOGFN("[perf] {:.1f} s: {:.0f} frames presented ({:.1f} fps), {} game swaps, {} vblanks ({} late over 0.5 ms, latest {:.1f} ms); the process used {:.0f}% of one core",
-            seconds, frames, frames / seconds, cp.swaps, cp.vblanks, cp.vblanksLate, cp.vblankLateMaxNs / 1e6, cpuPercent);
+        LOGFN("[perf] {:.1f} s: {:.0f} frames presented ({:.1f} fps), {} game swaps, {} vblanks ({} late over 0.5 ms, latest {:.1f} ms); the process used {:.0f}% of one core; {} missed wakes",
+            seconds, frames, frames / seconds, cp.swaps, cp.vblanks, cp.vblanksLate, cp.vblankLateMaxNs / 1e6, cpuPercent,
+            Park::MissedWakes().load());
         LOGFN("[perf]   game frame times: {} up to 20 ms, {} 20-36 ms, {} 36-52 ms, {} over 52 ms (stutters), longest {:.0f} ms",
             cp.swapIntervals[0], cp.swapIntervals[1], cp.swapIntervals[2], cp.swapIntervals[3], cp.swapIntervalMaxNs / 1e6);
         LOGFN("[perf]   game waits for the GPU {:.1f} ms a frame ({} waits, longest {:.1f} ms); GPU waits for the CPU {:.1f} ms a frame "

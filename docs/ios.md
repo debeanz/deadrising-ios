@@ -233,6 +233,28 @@ Logs for the next round (all in the four-finger log and the shared file):
   point, `game sub_XXXXXXXX`), with the app's share of time on the performance cores, the GPU's busy time, wakeups
   a second and the energy counter. With the `[cpu]` profiles this says which thread spends the power.
 
+Build 25 on the iPhone 15 (the roof, 720p, 4X MSAA): 28-47 fps, the app at 300% of one core, but only 3-13% of
+its CPU time on the performance cores: the frame's threads ran on the efficiency cores, 4-5 times slower than the
+PC for the same work. 4000-6000 wakeups a second: every waiting guest thread re-checked its wait every 10 ms, and
+timed waits (the game's D3D thread) polled every 0.5 ms; Apple's guidance is that many short wakeups make the
+system treat the work as light. Pipelines took 2-15 s each there (the pool threads ran at default QoS behind the
+game, and so did the Metal compiler working for them); Frank's skin was missing until his pipeline was made.
+And the edit meant for 5 pipeline threads had gone to the texture decode pool: still 3. Build 26:
+
+* waits (`kernel/park.h`) re-check after 10 ms, then less and less often up to every 100 ms (a re-check that
+  finds the wait over counts as a missed wake: 0 on the PC; `[perf]` and `[cpu] threads` show the count); timed
+  event and semaphore waits sleep until signalled or their deadline instead of polling;
+* pipeline threads: 4 on iPhone / iPad, QoS user-interactive (the Metal compiler follows), and a frame's new
+  pipelines go ahead of the list of earlier runs; texture decode threads also user-interactive;
+* a pipeline from the list of earlier runs is never skipped: the draw waits for it, or makes it itself if no
+  thread has started it. Only a pipeline never seen before can still be missing for a moment, once per device;
+* `[cpu] threads` adds each thread's scheduling priority (47: user-interactive), the CPU time by QoS class, and
+  from the process's resource usage the performance cores' share of cycles and instructions, the CPU energy in
+  watts and how much time threads were runnable but waiting for a core.
+
+The list (and the settings) live in the app's Documents folder: in LiveContainer, keep the app's data folder when
+installing a new build, or it starts empty again.
+
 ## Screen scaling and widescreen
 
 Screen Scaling (start screen and Settings; `ScreenScaling` in recomp_config.toml): Fit (the game's
