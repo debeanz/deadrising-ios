@@ -1,0 +1,872 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..fa92fe3 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -1,7 +1,28 @@
++#include <fstream>
++#include <mutex>
+ #include "shader.h"
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
+ 
++// Dead Rising: a shader that makes the translator fault must not take the whole run down.
++static bool SafeRecompile(ShaderRecompiler& recompiler, const uint8_t* data, const std::string_view& include)
++{
++#ifdef _WIN32
++    __try
++    {
++        recompiler.recompile(data, include);
++        return true;
++    }
++    __except (1 /* EXCEPTION_EXECUTE_HANDLER */)
++    {
++        return false;
++    }
++#else
++    recompiler.recompile(data, include);
++    return true;
++#endif
++}
++
+ static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
+ {
+     FILE* file = fopen(filePath, "rb");
+@@ -27,6 +48,7 @@ struct RecompiledShader
+     IDxcBlob* dxil = nullptr;
+     std::vector<uint8_t> spirv;
+     uint32_t specConstantsMask = 0;
++    uint32_t pixelOutputs = 0;
+ };
+ 
+ int main(int argc, char** argv)
+@@ -114,6 +136,7 @@ int main(int argc, char** argv)
+         }
+ 
+         std::atomic<uint32_t> progress = 0;
++        std::atomic<uint32_t> failures = 0;
+ 
+         std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
+             {
+@@ -121,20 +144,65 @@ int main(int argc, char** argv)
+ 
+                 thread_local ShaderRecompiler recompiler;
+                 recompiler = {};
+-                recompiler.recompile(shader.data, include);
++                if (!SafeRecompile(recompiler, shader.data, include))
++                {
++                    fprintf(stderr, "== FAILED %016llX (translation crashed)\n", (unsigned long long)hashShaderPair.first);
++                    {
++                        // Keep the container so the crash can be reproduced on its own (single file mode).
++                        static std::mutex mutex;
++                        std::lock_guard lock(mutex);
++                        auto container = reinterpret_cast<const ShaderContainer*>(shader.data);
++                        std::filesystem::path dir = std::filesystem::path(output).parent_path() / "failed";
++                        std::filesystem::create_directories(dir);
++                        std::ofstream(dir / fmt::format("{:016X}_crash.xenos", hashShaderPair.first), std::ios::binary)
++                            .write(reinterpret_cast<const char*>(shader.data), container->virtualSize + container->physicalSize);
++                    }
++                    ++failures;
++                    return;
++                }
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
++                shader.pixelOutputs = recompiler.pixelOutputs;
++
++                // Dead Rising: XENOS_DUMP_HLSL=<folder> keeps every translation for inspection.
++                if (const char* dumpDir = getenv("XENOS_DUMP_HLSL"))
++                {
++                    std::filesystem::create_directories(dumpDir);
++                    std::ofstream(std::filesystem::path(dumpDir) / fmt::format("{:016X}_{}.hlsl", hashShaderPair.first, recompiler.isPixelShader ? "ps" : "vs"), std::ios::binary) << recompiler.out;
++                    // XENOS_DUMP_ONLY=1: translate only (surveys), compile nothing.
++                    if (getenv("XENOS_DUMP_ONLY"))
++                        return;
++                }
+ 
+                 thread_local DxcCompiler dxcCompiler;
+ 
++                // Dead Rising: keep going when a shader fails, and keep its HLSL for inspection.
++                auto saveFailure = [&](const char* stage)
++                {
++                    static std::mutex mutex;
++                    std::lock_guard lock(mutex);
++                    std::filesystem::path dir = std::filesystem::path(output).parent_path() / "failed";
++                    std::filesystem::create_directories(dir);
++                    std::ofstream(dir / fmt::format("{:016X}_{}.hlsl", hashShaderPair.first, stage), std::ios::binary) << recompiler.out;
++                    fprintf(stderr, "== FAILED %016llX (%s, %s shader)\n", (unsigned long long)hashShaderPair.first, stage, recompiler.isPixelShader ? "pixel" : "vertex");
++                    ++failures;
++                };
++
+ #ifdef XENOS_RECOMP_DXIL
+                 shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
+-                assert(shader.dxil != nullptr);
+-                assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
++                if (shader.dxil == nullptr)
++                {
++                    saveFailure("dxil");
++                    return;
++                }
+ #endif
+ 
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+-                assert(spirv != nullptr);
++                if (spirv == nullptr)
++                {
++                    saveFailure("spirv");
++                    return;
++                }
+ 
+                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+                 assert(result);
+@@ -146,6 +214,7 @@ int main(int argc, char** argv)
+                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
+             });
+ 
++        fmt::println("Translated {} shaders, {} failed (their HLSL is in the 'failed' folder next to the output)", shaders.size(), failures.load());
+         fmt::println("Creating shader cache...");
+ 
+         StringBuffer f;
+@@ -157,8 +226,9 @@ int main(int argc, char** argv)
+ 
+         for (auto& [hash, shader] : shaders)
+         {
+-            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {} }},",
+-                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask);
++            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {} }},",
++                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask,
++                shader.pixelOutputs);
+ 
+             if (shader.dxil != nullptr)
+             {
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..c21166f 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -3,6 +3,9 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++#define SPEC_CONSTANT_MRT_ALIAS         (1 << 5) // Dead Rising: oC0 = the highest colour export
++#define SPEC_CONSTANT_FLIP_Z            (1 << 6) // Dead Rising: vertex shaders output z' = w - z
++#define SPEC_CONSTANT_DECODE_7E3        (1 << 7) // Dead Rising: oC0 holds 7e3 bits as unorm (fixed-point view)
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+@@ -26,10 +29,12 @@ struct PushConstants
+ 
+ [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+ 
+-#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+-#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+-#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+-#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 512)
++#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 516)
++#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 520)
++#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 528)
++#define g_ResolutionScale          vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 532)
++#define g_InputShift               vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 536)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -38,10 +43,12 @@ struct PushConstants
+ #else
+ 
+ #define DEFINE_SHARED_CONSTANTS() \
+-    uint g_Booleans : packoffset(c16.x); \
+-    uint g_SwappedTexcoords : packoffset(c16.y); \
+-    float2 g_HalfPixelOffset : packoffset(c16.z); \
+-    float g_AlphaThreshold : packoffset(c17.x);
++    uint g_Booleans : packoffset(c32.x); \
++    uint g_SwappedTexcoords : packoffset(c32.y); \
++    float2 g_HalfPixelOffset : packoffset(c32.z); \
++    float g_AlphaThreshold : packoffset(c33.x); \
++    float g_ResolutionScale : packoffset(c33.y); \
++    float g_InputShift : packoffset(c33.z);
+ 
+ uint g_SpecConstants();
+ 
+@@ -52,6 +59,13 @@ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+ TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+ SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+ 
++// Dead Rising: vertex shaders have no derivatives, so they sample the top mip level.
++#ifdef XENOS_VERTEX_SHADER
++#define XENOS_SAMPLE(texture, samplerState, coord) (texture).SampleLevel(samplerState, coord, 0)
++#else
++#define XENOS_SAMPLE(texture, samplerState, coord) (texture).Sample(samplerState, coord)
++#endif
++
+ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ {
+     uint2 dimensions;
+@@ -59,12 +73,104 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+     return dimensions;
+ }
+ 
+-float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++// Dead Rising: the sampler index carries flags above the heap index. Bit 31: a vertex fetch whose
++// fetch constant filters. Bits 24-29: a render target copy rendered at a higher resolution
++// (resolution scale x 4; 0 = as the console), whose host size is that many times the guest's:
++// unnormalized coordinates are in the guest's texels. Texel offsets and getWeights2D stay in the
++// host texture's texels: the game filters its 7e3 HDR scene by hand (taps half a texel apart,
++// weighted by getWeights2D), which on the host grid is an exact copy at any scale; on the guest
++// grid the taps and weights disagreed (blur at 2x, doubled rows and letters at 1.5x).
++#define SAMPLER_INDEX(samplerDescriptorIndex) ((samplerDescriptorIndex) & 0x00FFFFFFu)
++
++float textureScale(uint samplerDescriptorIndex)
++{
++    const uint code = (samplerDescriptorIndex >> 24) & 0x3Fu;
++    return code == 0 ? 1.0 : float(code) * 0.25;
++}
++
++float2 getGuestTexture2DDimensions(Texture2D<float4> texture, uint samplerDescriptorIndex)
+ {
++    return float2(getTexture2DDimensions(texture)) / textureScale(samplerDescriptorIndex);
++}
++
++float4 tfetch2DImpl(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, uint debugFlags)
++{
++    // Dead Rising debugging: bit 31 of g_SwappedTexcoords (DR_DEBUG_UV) returns the coordinate.
++    if (debugFlags & 0x80000000u)
++        return float4(frac(texCoord), 0.0, 1.0);
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    // Dead Rising: bit 31 of the sampler index marks a vertex fetch whose fetch constant filters.
++    SamplerState samplerState = g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)];
++#ifdef XENOS_VERTEX_SHADER
++    // Point-sampled vertex fetches read data (bone matrices) at texel edges: load the texel
++    // directly so no coordinate rounding can pick a neighbour.
++    if ((samplerDescriptorIndex & 0x80000000u) == 0)
++    {
++        int2 dimensions = int2(getTexture2DDimensions(texture));
++        int2 texel = int2(floor(texCoord * float2(dimensions) + offset + 1.0 / 512.0));
++        return texture.Load(int3(clamp(texel, int2(0, 0), dimensions - 1), 0));
++    }
++#endif
++    return XENOS_SAMPLE(texture, samplerState, texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
++// A macro so the shared constants (declared after this header for DXIL) are visible at the call.
++#define tfetch2D(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset) \
++    tfetch2DImpl(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset, g_SwappedTexcoords)
++
++// Dead Rising: fetches with an explicit LOD (setTexLOD + UseRegisterLOD, or UseComputedLOD off),
++// the computed LOD plus the instruction's bias, or register gradients (setGradientH/V).
++float4 tfetch2DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    SamplerState samplerState = g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)];
++#ifdef XENOS_VERTEX_SHADER
++    // As tfetch2DImpl: point-sampled vertex fetches load the texel (of the requested level).
++    if ((samplerDescriptorIndex & 0x80000000u) == 0)
++    {
++        uint width, height, levels;
++        texture.GetDimensions(0, width, height, levels);
++        const uint level = uint(clamp(round(lod), 0.0, float(levels - 1)));
++        texture.GetDimensions(level, width, height, levels);
++        int2 dimensions = int2(width, height);
++        int2 texel = int2(floor(texCoord * float2(dimensions) + offset + 1.0 / 512.0));
++        return texture.Load(int3(clamp(texel, int2(0, 0), dimensions - 1), level));
++    }
++#endif
++    return texture.SampleLevel(samplerState, texCoord + offset / getTexture2DDimensions(texture), lod);
++}
++
++float4 tfetch3DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
++{
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], texCoord, lod);
++}
++
++#ifndef XENOS_VERTEX_SHADER
++float4 tfetch2DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float bias)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    SamplerState samplerState = g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)];
++    return texture.SampleBias(samplerState, texCoord + offset / getTexture2DDimensions(texture), bias);
++}
++
++float4 tfetch2DGrad(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float3 gradH, float3 gradV)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    SamplerState samplerState = g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)];
++    return texture.SampleGrad(samplerState, texCoord + offset / getTexture2DDimensions(texture), gradH.xy, gradV.xy);
++}
++
++float4 tfetch3DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float bias)
++{
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], texCoord, bias);
++}
++
++float4 tfetch3DGrad(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 gradH, float3 gradV)
++{
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleGrad(g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], texCoord, gradH, gradV);
++}
++#endif
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+@@ -114,7 +220,7 @@ float h1(float a)
+ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
++    SamplerState samplerState = g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)];
+     uint2 dimensions = getTexture2DDimensions(texture);
+     
+     float x = texCoord.x * dimensions.x + offset.x;
+@@ -135,28 +241,49 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     float h1y = h1(fy);
+ 
+     float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
++        g0(fy) * (g0x * XENOS_SAMPLE(texture, samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
++            g1x * XENOS_SAMPLE(texture, samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
++        g1(fy) * (g0x * XENOS_SAMPLE(texture, samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
++            g1x * XENOS_SAMPLE(texture, samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+ 
+     return r;
+ }
+ 
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return XENOS_SAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], texCoord);
+ }
+ 
+ struct CubeMapData
+ {
+-    float3 cubeMapDirections[2];
++    float3 cubeMapDirections[16]; // Dead Rising: up to 9 cube instructions before their fetches
+     uint cubeMapIndex;
+ };
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return XENOS_SAMPLE(g_TextureCubeDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], cubeMapData.cubeMapDirections[texCoord.z]);
++}
++
++float4 tfetchCubeLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float lod)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], cubeMapData.cubeMapDirections[texCoord.z], lod);
++}
++
++#ifndef XENOS_VERTEX_SHADER
++float4 tfetchCubeBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float bias)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[SAMPLER_INDEX(samplerDescriptorIndex)], cubeMapData.cubeMapDirections[texCoord.z], bias);
++}
++#endif
++
++// Dead Rising: Xenos 7e3 floats (3-bit exponent, 7-bit mantissa, 0..31.875) seen as 10-bit unorm.
++float3 decode7e3(float3 packed)
++{
++    uint3 bits = uint3(round(saturate(packed) * 1023.0));
++    float3 exponent = float3(bits >> 7);
++    float3 mantissa = float3(bits & 127u) / 128.0;
++    return select(exponent > 0.0, (1.0 + mantissa) * exp2(exponent - 3.0), mantissa * 0.25);
+ }
+ 
+ float4 tfetchR11G11B10(uint4 value)
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..844d587 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -89,11 +89,13 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+     { DeclUsage::BlendIndices, 0, 9 },
+     { DeclUsage::BlendWeight, 0, 10 },
+     { DeclUsage::Color, 1, 11 },
+-    { DeclUsage::TexCoord, 4, 12 },
+-    { DeclUsage::TexCoord, 5, 13 },
+-    { DeclUsage::TexCoord, 6, 14 },
+-    { DeclUsage::TexCoord, 7, 15 },
+-    { DeclUsage::Position, 1, 15 },
++    // Dead Rising: vertex inputs are POSITION0, NORMAL0, TANGENT0, TEXCOORD0-3, COLOR0 and two sets
++    // of BLENDINDICES/BLENDWEIGHT; the second set takes the places of TEXCOORD6/7 and POSITION1
++    // (never used as inputs) so every input fits in 16 locations.
++    { DeclUsage::BlendIndices, 1, 12 },
++    { DeclUsage::BlendWeight, 1, 13 },
++    { DeclUsage::TexCoord, 4, 14 },
++    { DeclUsage::TexCoord, 5, 15 },
+ };
+ 
+ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+@@ -115,7 +117,11 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::TexCoord, 14 },
+     { DeclUsage::TexCoord, 15 },
+     { DeclUsage::Color, 0 },
+-    { DeclUsage::Color, 1 }
++    { DeclUsage::Color, 1 },
++    // Dead Rising passes these between stages too (NORMAL0 / NORMAL1 / TANGENT0 as interpolators).
++    { DeclUsage::Normal, 0 },
++    { DeclUsage::Normal, 1 },
++    { DeclUsage::Tangent, 0 }
+ };
+ 
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+@@ -225,8 +231,61 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
++    // Dead Rising: setTexLOD / setGradientH / setGradientV load the registers that fetches with
++    // UseRegisterLOD / UseRegisterGradients read (the reflection probes are filtered level by
++    // level with them; without the register every level sampled itself and stayed black).
++    if (instr.opcode == FetchOpcode::SetTextureLod || instr.opcode == FetchOpcode::SetTextureGradientsHorz ||
++        instr.opcode == FetchOpcode::SetTextureGradientsVert)
++    {
++        indent();
++        if (instr.isPredicated)
++            print("if ({}p0) ", instr.predCondition ? "" : "!");
++        if (instr.opcode == FetchOpcode::SetTextureLod)
++            println("texLod = r{}.{};", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3]);
++        else
++            println("{} = r{}.{}{}{};", instr.opcode == FetchOpcode::SetTextureGradientsHorz ? "texGradH" : "texGradV", instr.srcRegister,
++                SWIZZLES[instr.srcSwizzle & 0x3], SWIZZLES[(instr.srcSwizzle >> 2) & 0x3], SWIZZLES[(instr.srcSwizzle >> 4) & 0x3]);
++        return;
++    }
++
++    if (instr.opcode == FetchOpcode::GetTextureComputedLod)
++    {
++        // Dead Rising: getCompTexLOD returns the LOD the hardware would compute (pixel shaders).
++        indent();
++        if (instr.isPredicated)
++            print("if ({}p0) ", instr.predCondition ? "" : "!");
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        out += " = ";
++        if (!isPixelShader || instr.dimension == TextureDimension::TextureCube)
++        {
++            // Cube coordinates here are face coordinates (the direction went through cube()).
++            out += "0.0;\n";
++        }
++        else
++        {
++            const char* dim = instr.dimension == TextureDimension::Texture3D ? "3D" : "2D";
++            auto named = samplers.find(instr.constIndex);
++            const std::string name = named != samplers.end() ? std::string(named->second) : fmt::format("s{}", instr.constIndex);
++            print("g_Texture{0}DescriptorHeap[{1}_Texture{0}DescriptorIndex].CalculateLevelOfDetail(g_SamplerDescriptorHeap[SAMPLER_INDEX({1}_SamplerDescriptorIndex)], r{2}.",
++                dim, name, instr.srcRegister);
++            const uint32_t components = instr.dimension == TextureDimension::Texture3D ? 3 : instr.dimension == TextureDimension::Texture1D ? 1 : 2;
++            if (components == 1)
++                print("{}{}", SWIZZLES[instr.srcSwizzle & 0x3], SWIZZLES[instr.srcSwizzle & 0x3]);
++            else
++                for (uint32_t i = 0; i < components; i++)
++                    out += SWIZZLES[(instr.srcSwizzle >> (i * 2)) & 0x3];
++            out += ");\n";
++        }
++        return;
++    }
++
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
++    {
++        indent();
++        println("// unhandled fetch opcode {}", uint32_t(instr.opcode));
+         return;
++    }
+ 
+     if (instr.isPredicated)
+     {
+@@ -238,6 +297,14 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         ++indentation;
+     }
+ 
++    // Dead Rising: filter overrides (3 = use the fetch constant's) are not applied; none of this
++    // game's shaders has one, so mark them in the HLSL should another game need it.
++    if (instr.opcode == FetchOpcode::TextureFetch && (instr.magFilter != 3 || instr.minFilter != 3 || instr.mipFilter != 3 || instr.anisoFilter != 7))
++    {
++        indent();
++        println("// filter override: mag {} min {} mip {} aniso {}", uint32_t(instr.magFilter), uint32_t(instr.minFilter), uint32_t(instr.mipFilter), uint32_t(instr.anisoFilter));
++    }
++
+     auto printSrcRegister = [&](size_t componentCount)
+         {
+             print("r{}.", instr.srcRegister);
+@@ -307,7 +374,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     switch (instr.dimension)
+     {
+     case TextureDimension::Texture1D:
+-        dimension = "1D";
++        // Dead Rising: 1D textures are fetched as 2D textures of height 1 (there is no 1D heap).
++        dimension = "2D";
+         componentCount = 1;
+         break;
+     case TextureDimension::Texture2D:
+@@ -331,11 +399,66 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         out += "Bicubic";
+ #endif
+ 
++    // Dead Rising: LOD selection as Xenia does it: the register LOD (setTexLOD) when the fetch says
++    // UseRegisterLOD, else the computed LOD (pixel shaders only), else LOD 0; the instruction's
++    // LOD bias (signed, 1/16 steps) is added to either. Register gradients replace the computed
++    // derivatives. A fetch with the defaults keeps the plain call.
++    std::string lodArgument;
++    if (instr.opcode == FetchOpcode::TextureFetch)
++    {
++        const float bias = instr.lodBias / 16.0f;
++        const std::string biasText = bias != 0.0f ? fmt::format(" + {}", bias) : std::string();
++        if (instr.useRegLod)
++        {
++            out += "Level";
++            lodArgument = fmt::format(", texLod{}", biasText);
++        }
++        else if (instr.useRegGradients && isPixelShader && instr.dimension != TextureDimension::TextureCube)
++        {
++            out += "Grad";
++            lodArgument = ", texGradH, texGradV";
++        }
++        else if (!instr.useCompLod || !isPixelShader)
++        {
++            // Vertex shaders already sample level 0; only a bias changes them.
++            if (isPixelShader || bias != 0.0f)
++            {
++                out += "Level";
++                lodArgument = fmt::format(", {}", bias);
++            }
++        }
++        else if (bias != 0.0f)
++        {
++            out += "Bias";
++            lodArgument = fmt::format(", {}", bias);
++        }
++    }
++
+     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+-    printSrcRegister(componentCount);
++    // Dead Rising: tx_coord_denorm fetches take texel coordinates (bone matrices in vertex textures).
++    const bool denorm = instr.texCoordDenorm && dimension == "2D";
++    if (instr.dimension == TextureDimension::Texture1D)
++    {
++        out += "float2(";
++        printSrcRegister(componentCount);
++        if (denorm)
++            print(" / getGuestTexture2DDimensions(g_Texture2DDescriptorHeap[{0}_Texture2DDescriptorIndex], {0}_SamplerDescriptorIndex).x", constNamePtr);
++        out += ", 0.5)";
++    }
++    else
++    {
++        if (denorm)
++            out += "(";
++        printSrcRegister(componentCount);
++        if (denorm)
++            print(") / getGuestTexture2DDimensions(g_Texture2DDescriptorHeap[{0}_Texture2DDescriptorIndex], {0}_SamplerDescriptorIndex)", constNamePtr);
++    }
+ 
+     switch (instr.dimension)
+     {
++    case TextureDimension::Texture1D:
++        print(", float2({}, 0)", instr.offsetX * 0.5f);
++        break;
+     case TextureDimension::Texture2D:
+         print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
+         break;
+@@ -344,6 +467,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         break;
+     }
+ 
++    out += lodArgument;
+     out += ").";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+@@ -455,7 +579,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             }
+             else
+             {
+-                auto findResult = float4Constants.find(reg);
++                // Literal (def) constants take priority over the constant table: Dead Rising's
++                // converted shaders declare every register through one full-range table.
++                auto findResult = literalFloat4.count(reg) ? float4Constants.end() : float4Constants.find(reg);
+                 if (findResult != float4Constants.end())
+                 {
+                     const char* constantName = reinterpret_cast<const char*>(constantTableData + findResult->second->name);
+@@ -949,7 +1075,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             break;
+ 
+         case AluScalarOpcode::SetpInv:
+-            print("{0} == 0.0 ? 1.0 : {0}", op(SCALAR_0));
++            // Dead Rising: 1 becomes 0 (and sets p0), 0 becomes 1, anything else is kept. Without
++            // the first case the predicate counter of nested branches drifts (the title screen's
++            // RGB -> HSV grading took wrong branches: red and green speckle on saturated colours).
++            print("{0} == 1.0 ? 0.0 : ({0} == 0.0 ? 1.0 : {0})", op(SCALAR_0));
+             break;
+ 
+         case AluScalarOpcode::SetpPop:
+@@ -1105,6 +1234,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    // Dead Rising: vertex shaders fetch textures too; the common header samples with an explicit LOD there.
++    if ((shaderContainer->flags & 0x1) != 0)
++        out += "#define XENOS_VERTEX_SHADER\n";
++
+     out += include;
+     out += '\n';
+ 
+@@ -1171,14 +1304,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         case RegisterSet::Sampler:
+         {
++            // Dead Rising: 32 slots per texture type (Xenos has 32 texture fetch constants and vertex
++            // shaders fetch from 16 and up), so 128 bytes per type; the shared constants follow at 512.
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j], j * 128 + constantInfo->registerIndex * 4);
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName, std::size(TEXTURE_DIMENSIONS) * 128 + constantInfo->registerIndex * 4);
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1233,11 +1368,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                    constantName, TEXTURE_DIMENSIONS[j], j * 8 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+             }
+ 
+             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                constantName, 8 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+         }
+     }
+ 
+@@ -1288,6 +1423,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "#endif\n";
+ 
+         auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
++        pixelOutputs = pixelShader->outputs;
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
+             out += ",\n\tout float4 oC0 : SV_Target0";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
+@@ -1347,7 +1483,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     #endif
+ 
+-        out += "\tout float4 oPos : SV_Position";
++        // Dead Rising: precise, so every shader computes the position in the same order without
++        // fused multiply-adds: the game draws skinned meshes into a depth pre-pass with one shader
++        // and again with GREATER_EQUAL depth with another, which must give bit-identical depth.
++        out += "\tout precise float4 oPos : SV_Position";
+ 
+         for (auto& [usage, usageIndex] : INTERPOLATORS)
+             print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+@@ -1383,6 +1522,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
+                     definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
++                literalFloat4.insert(definition->registerIndex + i - (isPixelShader ? 256 : 0));
+ 
+                 value += 4;
+             }
+@@ -1418,7 +1558,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "\n";
+     }
+ 
+-    bool printedRegisters[32]{};
++    bool printedRegisters[128]{};
++
++    if (isPixelShader)
++    {
++        // Dead Rising: the interpolated inputs are evaluated g_InputShift host pixels up and to
++        // the left (before they are copied into registers). At a resolution scale geometry moves
++        // half a host pixel (g_HalfPixelOffset), so a quad starting at the screen edge still
++        // covers the first column and row as at 1x, and the rest of the console's half-pixel
++        // offset, (scale - 1) / 2 host pixels, is applied here, which keeps texture coordinates on
++        // host texel centres. (Moving geometry the whole half guest pixel left the first row and
++        // column black: a dark bar, and motion blur smeared it.) The renderer sets other values
++        // for draws that need them (the EDRAM restore pair: -0.5, see PrepareDraw); 0: nothing.
++        out += "\t[branch] if (g_InputShift != 0.0)\n\t{\n";
++        for (auto& [usage, usageIndex] : INTERPOLATORS)
++            println("\t\ti{0}{1} -= g_InputShift * (ddx(i{0}{1}) + ddy(i{0}{1}));", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
++        out += "\t}\n\n";
++    }
+ 
+     uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
+ 
+@@ -1457,14 +1613,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "\n";
+     }
+ 
+-    for (size_t i = 0; i < 32; i++)
++    for (size_t i = 0; i < 128; i++)
+     {
+         if (!printedRegisters[i])
+         {
+-            print("\tfloat4 r{} = ", i);
++            // Dead Rising: vertex shader registers are precise. The game draws skinned meshes in
++            // several passes with different shaders (depth pre-pass, colour, lighting) and tests
++            // GREATER_EQUAL; DXC only traces oPos's precise partway back through the registers
++            // for SPIR-V, and the Vulkan driver then fused the rest differently per shader
++            // (z-fighting: black and light triangles on faces).
++            print("\t{}float4 r{} = ", isPixelShader ? "" : "precise ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
+-                out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++                // Dead Rising: VPOS in the guest's pixels (g_ResolutionScale: host pixels per guest
++                // pixel of the pass; 0 if never set).
++                out += "float4((iPos.xy / (g_ResolutionScale > 0.0 ? g_ResolutionScale : 1.0) - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+             }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+@@ -1482,7 +1645,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "\tint a0 = 0;\n";
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+-    out += "\tfloat ps = 0.0;\n";
++    out += "\tfloat texLod = 0.0;\n"; // Dead Rising: the LOD register setTexLOD loads
++    out += "\tfloat3 texGradH = 0.0;\n"; // Dead Rising: setGradientH / setGradientV
++    out += "\tfloat3 texGradV = 0.0;\n";
++    out += isPixelShader ? "\tfloat ps = 0.0;\n" : "\tprecise float ps = 0.0;\n";
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP
+@@ -1612,6 +1778,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
+             bool shouldCloseCurlyBracket = false;
++            std::string blockCondition; // conditional exec: wraps the block's instructions
+ 
+             switch (cfInstr.opcode)
+             {
+@@ -1630,7 +1797,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++                // Dead Rising: the block only runs when the boolean constant matches the condition.
++                {
++                    auto findResult = boolConstants.find(boolIndex(cfInstr.condExec.boolAddress));
++                    if (findResult != boolConstants.end())
++                        blockCondition = fmt::format("((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condExec.condition ? "!" : "=");
++                    else
++                        blockCondition = fmt::format("(b{} {}= 0)", uint32_t(cfInstr.condExec.boolAddress), cfInstr.condExec.condition ? "!" : "=");
++                }
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -1639,6 +1814,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 count = cfInstr.condExecPred.count;
+                 sequence = cfInstr.condExecPred.sequence;
+                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecPredEnd);
++                // Dead Rising: the block only runs when the predicate matches the condition.
++                blockCondition = cfInstr.condExecPred.condition ? "(p0)" : "(!p0)";
+                 break;
+ 
+             case ControlFlowOpcode::LoopStart:
+@@ -1694,7 +1871,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     }
+                     else
+                     {
+-                        auto findResult = boolConstants.find(cfInstr.condJmp.boolAddress);
++                        auto findResult = boolConstants.find(boolIndex(cfInstr.condJmp.boolAddress));
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+@@ -1720,7 +1897,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             }
+ 
+             auto instructionCode = code + address * 3;
+-            
++
++            if (!blockCondition.empty() && count != 0)
++            {
++                indent();
++                println("if {}", blockCondition);
++                indent();
++                out += "{\n";
++                ++indentation;
++            }
++
+             for (uint32_t i = 0; i < count; i++)
+             {
+                 union
+@@ -1792,6 +1978,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 instructionCode += 3;
+             }
+ 
++            if (!blockCondition.empty() && count != 0)
++            {
++                --indentation;
++                indent();
++                out += "}\n";
++            }
++
+             if (shouldReturn)
+             {
+                 if (isPixelShader)
+@@ -1809,6 +2002,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     indent();
+                     out += "}";
+ 
++                    // Dead Rising: render targets that alias one EDRAM buffer keep the highest
++                    // export (the EDRAM restore writes its colour through oC1); the host binds
++                    // that buffer as target 0.
++                    if ((pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0) != 0 && (pixelOutputs & 0xE) != 0)
++                    {
++                        const uint32_t highest = (pixelOutputs & 0x8) ? 3 : (pixelOutputs & 0x4) ? 2 : 1;
++                        specConstantsMask |= SPEC_CONSTANT_MRT_ALIAS;
++                        indent();
++                        println("[branch] if (g_SpecConstants() & SPEC_CONSTANT_MRT_ALIAS) oC0 = oC{};", highest);
++                    }
++
++                    // Dead Rising: drawing through the 10:10:10:2 fixed-point view of the HDR (7e3)
++                    // buffer writes raw bits; the host buffer holds values, so decode them.
++                    if ((pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0) != 0)
++                    {
++                        specConstantsMask |= SPEC_CONSTANT_DECODE_7E3;
++                        indent();
++                        out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_DECODE_7E3) oC0.rgb = decode7e3(oC0.rgb);\n";
++                    }
++
+                 #ifdef UNLEASHED_RECOMP
+                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
+ 
+@@ -1834,6 +2047,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     {
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                     }
++
++                    // Dead Rising: draws with an inverted viewport depth range (reversed Z) get
++                    // z' = w - z and the range swapped on the host, which keeps the stored depth.
++                    specConstantsMask |= SPEC_CONSTANT_FLIP_Z;
++                    out += "\t[branch] if (g_SpecConstants() & SPEC_CONSTANT_FLIP_Z) oPos.z = oPos.w - oPos.z;\n";
+                 }
+ 
+                 if (simpleControlFlow)
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..c857e48 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -1,3 +1,4 @@
++#include <unordered_set>
+ #pragma once
+ 
+ #include "shader.h"
+@@ -29,10 +30,18 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+     std::unordered_map<uint32_t, std::string> interpolators;
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
++    std::unordered_set<uint32_t> literalFloat4; // registers defined by literal (def) constants
+     std::unordered_map<uint32_t, const char*> boolConstants;
++
++    // Dead Rising (2006 compiler): pixel shaders address their booleans absolutely (128 + index).
++    uint32_t boolIndex(uint32_t boolAddress) const
++    {
++        return (isPixelShader && boolAddress >= 128) ? boolAddress - 128 : boolAddress;
++    }
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    uint32_t pixelOutputs = 0; // Dead Rising: PIXEL_SHADER_OUTPUT_* of a pixel shader
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;

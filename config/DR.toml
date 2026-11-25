@@ -1,0 +1,67 @@
+# Dead Rising (Xbox 360) - XenonRecomp configuration
+[main]
+file_path = "../private/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "DR_switch_tables.toml"
+
+# Keep optimizations off until the recompilation actually runs.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Found with xexinfo (byte patterns from the XenonRecomp README), each unique.
+restgprlr_14_address = 0x82532CE0
+savegprlr_14_address = 0x82532C90
+restfpr_14_address = 0x82533B9C
+savefpr_14_address = 0x82533B50
+restvmx_14_address = 0x825340A8
+savevmx_14_address = 0x82533E10
+restvmx_64_address = 0x8253413C
+savevmx_64_address = 0x82533EA4
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding
+]
+
+# 60 fps (docs/frame_rate.md, runtime/src/patches/frame_rate_hooks.cpp). Frank's airborne branch
+# in sub_821FF738 adds gravity to his fall speed (+4208) and moves him by it once per frame;
+# both get scaled by the unit's step (1.0 at 30 fps).
+[[midasm_hook]]
+name = "PlayerGravityMidAsmHook"
+address = 0x821FFACC
+registers = ["f0", "r31"]
+
+[[midasm_hook]]
+name = "PlayerFallMidAsmHook"
+address = 0x821FFAF4
+registers = ["f0", "r31"]
+
+# sub_822C4AC8 (Frank's jump state) moves him each frame by his facing direction x the jump speed
+# (+5604, 13.0): the speed is scaled by the step (60 fps jumps went twice as far).
+[[midasm_hook]]
+name = "PlayerJumpMoveMidAsmHook"
+address = 0x822C4CD4
+registers = ["f0", "r31"]
+
+# sub_82752FE0 (unit move pass), before each unit's move() call: above 30 fps the UI units (menus,
+# HUD, messages, fades) move every other frame (frame_rate.h); true skips to after the call.
+[[midasm_hook]]
+name = "UnitMoveSkipMidAsmHook"
+address = 0x82753168
+registers = ["r31"]
+jump_address_on_true = 0x8275317C
+
+# sTaskManager::move (sub_8219A2A0): above 30 fps the current game task's own move (vtable slot 24:
+# title menu, date screen and other frame-counting tasks) runs on UI frames only, like the game's
+# pause check just before it; the task's slots 32 / 36 and the manager's bookkeeping run every
+# frame (skipping the whole manager every other frame made marker labels' backgrounds blink).
+[[midasm_hook]]
+name = "TaskMoveSkipMidAsmHook"
+address = 0x8219A344
+registers = ["r3"]
+jump_address_on_true = 0x8219A354

@@ -1,0 +1,151 @@
+# iPhone / iPad build (docs/ios.md): an unsigned IPA of Dead Rising recompiled from YOUR
+# default.xex and shader archive.
+#
+# Two repositories (as lm-ios / lm-ios-data):
+#  - this one (public: GitHub-hosted Mac minutes are free) holds only source code and runs this
+#    workflow;
+#  - a PRIVATE data repository (repository variable GAME_DATA_REPO, e.g. you/deadrising-ios-data)
+#    holds default.xex and shader.arc (release "game-data", uploaded by scripts/ios/publish-data.ps1)
+#    and receives the finished IPA and the full build log (release "ios-<run number>").
+# Secret GAME_DATA_TOKEN: a fine-grained token with Contents read/write on the data repository.
+#
+# Nothing derived from the game goes into this repository: no artifacts, no caches of generated
+# code, and the public log shows no generated code (messages about ppc/ are only counted).
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      DATA_REPO: ${{ vars.GAME_DATA_REPO }}
+      GH_TOKEN: ${{ secrets.GAME_DATA_TOKEN }}
+      TAG: ios-${{ github.run_number }}
+      MOLTENVK_VERSION: v1.2.11
+    steps:
+      - name: Check the data repository
+        run: |
+          if [ -z "$DATA_REPO" ] || [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set the repository variable GAME_DATA_REPO and the secret GAME_DATA_TOKEN (docs/ios.md)."
+            exit 1
+          fi
+          vis=$(gh repo view "$DATA_REPO" --json visibility -q .visibility)
+          echo "data repository visibility: $vis"
+          if [ "$vis" != "PRIVATE" ]; then
+            echo "::error::The data repository must be private: it holds your game files and the IPA."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Get default.xex and shader.arc (private data repository)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gamedata"
+          gh release download game-data --repo "$DATA_REPO" -p default.xex -p shader.arc -D "$RUNNER_TEMP/gamedata" --clobber
+          for f in default.xex shader.arc; do
+            echo "$f: $(stat -f %z "$RUNNER_TEMP/gamedata/$f") bytes, SHA-1 $(shasum -a 1 "$RUNNER_TEMP/gamedata/$f" | cut -d' ' -f1)"
+          done
+
+      - name: Tools (Xcode, Ninja, PowerShell)
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          xcodebuild -version
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          command -v pwsh || brew install --cask powershell
+          cmake --version | head -1
+
+      - name: MoltenVK (Vulkan on Metal)
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/moltenvk.tar" "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-ios.tar"
+          mkdir -p "$RUNNER_TEMP/moltenvk" && tar -xf "$RUNNER_TEMP/moltenvk.tar" -C "$RUNNER_TEMP/moltenvk"
+          fw=$(find "$RUNNER_TEMP/moltenvk" -path "*dynamic*" -path "*ios-arm64/MoltenVK.framework" -type d | grep -v simulator | head -1)
+          test -n "$fw" || { echo "::error::MoltenVK.framework (dynamic, ios-arm64) not found"; find "$RUNNER_TEMP/moltenvk" -maxdepth 5 -type d | head -50; exit 1; }
+          echo "MOLTENVK_FRAMEWORK=$fw" >> "$GITHUB_ENV"
+          echo "MoltenVK: $fw"
+
+      - name: FFmpeg (XMA audio decoder only)
+        run: |
+          git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git "$RUNNER_TEMP/ffmpeg"
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          sh scripts/ffmpeg/configure.sh "$RUNNER_TEMP/ffmpeg" "$RUNNER_TEMP/ffmpeg-build" \
+            --enable-cross-compile --target-os=darwin --arch=arm64 --cc="$(xcrun --sdk iphoneos -f clang)" \
+            --sysroot="$sdk" --extra-cflags="-arch arm64 -miphoneos-version-min=16.0" \
+            --extra-ldflags="-arch arm64 -miphoneos-version-min=16.0" --prefix="$RUNNER_TEMP/ffmpeg-ios"
+          make -C "$RUNNER_TEMP/ffmpeg-build" -j"$(sysctl -n hw.ncpu)" install > "$RUNNER_TEMP/ffmpeg-make.log" 2>&1 ||
+            { tail -40 "$RUNNER_TEMP/ffmpeg-make.log"; exit 1; }
+          ls -l "$RUNNER_TEMP/ffmpeg-ios/lib"
+          echo "FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-ios" >> "$GITHUB_ENV"
+
+      - name: Generate the game code and shaders (from your files)
+        run: |
+          log="$RUNNER_TEMP/codegen.log"
+          set +e
+          bash scripts/ios/codegen.sh "$RUNNER_TEMP/gamedata/default.xex" "$RUNNER_TEMP/gamedata/shader.arc" > "$log" 2>&1
+          status=$?
+          set -e
+          mkdir -p "$RUNNER_TEMP/out" && cp "$log" "$RUNNER_TEMP/out/codegen-${{ github.run_number }}.log"
+          grep -E "^==>|applied|Translated|FAILED|error|generated" "$log" | grep -v "ppc/" | head -100 || true
+          exit $status
+
+      - name: Configure (iOS arm64)
+        run: |
+          cmake -S runtime -B build/ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDR_MOLTENVK_FRAMEWORK="$MOLTENVK_FRAMEWORK" \
+            -DDR_FFMPEG_DIR="$FFMPEG_DIR" \
+            -DDR_SHADER_CACHE="$PWD/analysis/shader_cache/shader_cache.cpp" \
+            -DDR_SHADER_KEYS="$PWD/analysis/shaders_2008/shader_keys.cpp"
+
+      - name: Build
+        id: build
+        run: |
+          log="$RUNNER_TEMP/out/build-${{ github.run_number }}.log"
+          set +e
+          cmake --build build/ios --target DRRecomp -- -k 0 > "$log" 2>&1
+          status=$?
+          set -e
+          gen=$(grep -c "ppc/" "$log" || true)
+          echo "build exit status $status; $gen log lines mention generated game code (see the private build log)"
+          grep -E "(error|warning):|FAILED:|Error [0-9]+" "$log" | grep -v "ppc/" | head -300 || true
+          tail -5 "$log" | grep -v "ppc/" || true
+          exit $status
+
+      - name: Package the IPA
+        run: |
+          app=$(find build/ios -maxdepth 2 -name "DeadRising.app" -type d | head -1)
+          test -n "$app" || { echo "::error::DeadRising.app not found"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Info.plist"
+          file "$app/DeadRising"
+          ls "$app/Frameworks" || true
+          du -sh "$app"
+          cd "$RUNNER_TEMP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$GITHUB_WORKSPACE/$app" Payload/
+          zip -qry "out/DeadRising-${{ github.run_number }}.ipa" Payload
+          cp "$GITHUB_WORKSPACE/runtime/ios/DeadRising.entitlements" out/
+          ls -lh out
+
+      - name: Deliver to the private data repository
+        if: always()
+        run: |
+          cd "$RUNNER_TEMP/out" 2>/dev/null || exit 0
+          ok="${{ job.status }}"
+          title="iOS build ${{ github.run_number }}"
+          [ "$ok" = "success" ] || title="$title - FAILED (logs only)"
+          gh release create "$TAG" --repo "$DATA_REPO" --title "$title" \
+            --notes "From ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}, run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Install with SideStore, AltStore, Sideloadly or LiveContainer, keeping the entitlements (docs/ios.md). Copy your game folder to Files > On My iPhone > Dead Rising > game." \
+            ./*
+          echo "Delivered to the private repository: release $TAG"

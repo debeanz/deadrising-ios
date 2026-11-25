@@ -1,0 +1,15 @@
+[submodule "tools/XenonRecomp"]
+	path = tools/XenonRecomp
+	url = https://github.com/hedge-dev/XenonRecomp.git
+[submodule "tools/XenosRecomp"]
+	path = tools/XenosRecomp
+	url = https://github.com/squidbus/XenosRecomp.git
+[submodule "tools/plume"]
+	path = tools/plume
+	url = https://github.com/DevZer0D4Y/plume.git
+[submodule "runtime/thirdparty/SDL"]
+	path = runtime/thirdparty/SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "runtime/thirdparty/unordered_dense"]
+	path = runtime/thirdparty/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git

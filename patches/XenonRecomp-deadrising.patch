@@ -1,0 +1,447 @@
+diff --git a/XenonAnalyse/function.cpp b/XenonAnalyse/function.cpp
+index 34add40..21e3f7b 100644
+--- a/XenonAnalyse/function.cpp
++++ b/XenonAnalyse/function.cpp
+@@ -38,7 +38,7 @@ size_t Function::SearchBlock(size_t address) const
+     return -1;
+ }
+ 
+-Function Function::Analyze(const void* code, size_t size, size_t base)
++Function Function::Analyze(const void* code, size_t size, size_t base, const SwitchLookup& switchLookup)
+ {
+     Function fn{ base, 0 };
+ 
+@@ -58,6 +58,7 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
+     std::vector<size_t> blockStack{};
+     blockStack.reserve(32);
+     blockStack.emplace_back();
++    std::vector<size_t> switchLabels{}; // block bases reached only through a jump table
+ 
+     #define RESTORE_DATA() if (!blockStack.empty()) data = (dataStart + ((blocks[blockStack.back()].base + blocks[blockStack.back()].size) / sizeof(*data))) - 1; // continue adds one
+ 
+@@ -70,6 +71,27 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
+             break; // it's hideover
+         }
+ 
++        // Start of a known jump table sequence (XenonAnalyse keys tables by the "lis" that loads them):
++        // queue every case label as a block of this function, explored after the current block ends.
++        if (switchLookup)
++        {
++            if (const auto* labels = switchLookup(addr))
++            {
++                for (uint32_t label : *labels)
++                {
++                    if (label < base || label >= base + size)
++                        continue;
++
++                    switchLabels.push_back(label - base);
++                    if (fn.SearchBlock(label) != -1)
++                        continue;
++
++                    blocks.emplace_back(label - base, 0);
++                    blockStack.insert(blockStack.end() - 1, blocks.size() - 1);
++                }
++            }
++        }
++
+         auto& curBlock = blocks[blockStack.back()];
+         DEBUG(const auto blockBase = curBlock.base);
+         const uint32_t instruction = ByteSwap(*data);
+@@ -226,6 +248,12 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
+                 continue;
+             }
+ 
++            // A gap before a jump table case is fine: it is usually the inline table data.
++            if (std::find(switchLabels.begin(), switchLabels.end(), blocks[i + 1].base) != switchLabels.end())
++            {
++                continue;
++            }
++
+             discontinuity = i + 1;
+             break;
+         }
+diff --git a/XenonAnalyse/function.h b/XenonAnalyse/function.h
+index 7df1c6a..ccc2399 100644
+--- a/XenonAnalyse/function.h
++++ b/XenonAnalyse/function.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
++#include <functional>
+ #include <vector>
+ 
+ #ifdef _DEBUG
+@@ -47,5 +49,8 @@ struct Function
+     }
+     
+     size_t SearchBlock(size_t address) const;
+-    static Function Analyze(const void* code, size_t size, size_t base);
++    // Optional: returns the jump table labels for a bctr at the given address, or nullptr.
++    // Lets the analyzer follow switch cases instead of treating bctr as a tail call.
++    using SwitchLookup = std::function<const std::vector<uint32_t>*(size_t)>;
++    static Function Analyze(const void* code, size_t size, size_t base, const SwitchLookup& switchLookup = {});
+ };
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..a3119a1 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -35,9 +35,21 @@ void ReadTable(Image& image, SwitchTable& table)
+     if (table.type == SWITCH_ABSOLUTE)
+     {
+         const auto* offsets = (be<uint32_t>*)image.Find(pOffset);
++        size_t lowestLabel = SIZE_MAX;
+         for (size_t i = 0; i < table.labels.size(); i++)
+         {
++            // An inline table can never run into its own case code. If it does, the bound
++            // check came from a neighbouring function (ScanTable looks back 32 instructions).
++            if (pOffset + i * 4 >= lowestLabel)
++            {
++                fmt::println("Truncated jump table at 0x{:X} from {} to {} entries", table.base, table.labels.size(), i);
++                table.labels.resize(i);
++                break;
++            }
++
+             table.labels[i] = offsets[i];
++            if (table.labels[i] > pOffset) // only case code placed after the table can bound it
++                lowestLabel = std::min<size_t>(lowestLabel, table.labels[i]);
+         }
+     }
+     else if (table.type == SWITCH_COMPUTED)
+@@ -242,6 +254,45 @@ int main(int argc, char** argv)
+                             printTable(table);
+                             switches.emplace_back(std::move(table));
+                         }
++                        else if (type == SWITCH_ABSOLUTE)
++                        {
++                            // No bound check in sight (e.g. the index comes from XGetVideoMode). Accept the
++                            // table only if it is stored inline right after the bctr; ReadTable stops at the
++                            // first case label, and entries must point into this code section.
++                            const size_t address = base + (data - dataStart);
++                            ppc_insn insn;
++                            ppc::Disassemble(data, address, insn);
++                            uint32_t tableAddress = insn.operands[1] << 16;
++                            ppc::Disassemble(data + 4, address + 4, insn);
++                            tableAddress += int16_t(insn.operands[2]);
++                            ppc::Disassemble(data + 8, address + 8, insn); // rlwinm r0, rIndex, 2, 0, 29
++
++                            if (tableAddress == address + 0x18)
++                            {
++                                table.base = address;
++                                table.r = insn.operands[1];
++                                table.defaultLabel = 0;
++                                table.labels.resize(256);
++                                ReadTable(image, table);
++
++                                size_t valid = 0;
++                                while (valid < table.labels.size() &&
++                                       (table.labels[valid] & 3) == 0 &&
++                                       table.labels[valid] >= section.base && table.labels[valid] < section.base + section.size)
++                                {
++                                    valid++;
++                                }
++                                table.labels.resize(valid);
++
++                                if (!table.labels.empty())
++                                {
++                                    fmt::println("Unbounded inline jump table at 0x{:X}: {} entries", table.base, table.labels.size());
++                                    println("# no bound check found; size taken from the inline table");
++                                    printTable(table);
++                                    switches.emplace_back(std::move(table));
++                                }
++                            }
++                        }
+ 
+                         data += 4;
+                     }
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..0bb8fea 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -95,6 +95,13 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
+ 
+ void Recompiler::Analyse()
+ {
++    // Lets the function analyzer follow jump table cases (bctr) as part of the same function.
++    const Function::SwitchLookup switchLookup = [this](size_t addr) -> const std::vector<uint32_t>*
++    {
++        auto it = config.switchTables.find(uint32_t(addr));
++        return it != config.switchTables.end() ? &it->second.labels : nullptr;
++    };
++
+     for (size_t i = 14; i < 128; i++)
+     {
+         if (i < 32)
+@@ -213,7 +220,7 @@ void Recompiler::Analyse()
+                 if (address >= section.base && address < section.base + section.size && image.symbols.find(address) == image.symbols.end())
+                 {
+                     auto data = section.data + address - section.base;
+-                    auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address));
++                    auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address, switchLookup));
+                     image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+                 }
+             }
+@@ -242,7 +249,7 @@ void Recompiler::Analyse()
+             }
+             else
+             {
+-                auto& fn = functions.emplace_back(Function::Analyze(data, dataEnd - data, base));
++                auto& fn = functions.emplace_back(Function::Analyze(data, dataEnd - data, base, switchLookup));
+                 image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+ 
+                 base += fn.size;
+@@ -618,7 +625,7 @@ bool Recompiler::Recompile(
+                 if (label < fn.base || label >= fn.base + fn.size)
+                 {
+                     println("\t\t// ERROR: 0x{:X}", label);
+-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
++                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X} (fn {:X} size {:X})", base, label, fn.base, fn.size);
+                     println("\t\treturn;");
+                 }
+                 else
+@@ -826,24 +833,28 @@ bool Recompiler::Recompile(
+         println("{}.u32) & ~127), 0, 128);", r(insn.operands[1]));
+         break;
+ 
++    // PPC never traps on division: a zero divisor (or INT_MIN / -1) gives an undefined result.
++    // Guard so the host does not raise a divide exception instead.
+     case PPC_INST_DIVD:
+-        println("\t{}.s64 = {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s64 = ({}.s64 == 0 || ({}.s64 == INT64_MIN && {}.s64 == -1)) ? 0 : {}.s64 / {}.s64;",
++            r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_DIVDU:
+-        println("\t{}.u64 = {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u64 = {}.u64 == 0 ? 0 : {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVW:
+-        println("\t{}.s32 = {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.s32 = ({}.s32 == 0 || ({}.s32 == INT32_MIN && {}.s32 == -1)) ? 0 : {}.s32 / {}.s32;",
++            r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVWU:
+-        println("\t{}.u32 = {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{}.u32 = {}.u32 == 0 ? 0 : {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[2]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+@@ -1260,7 +1271,10 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        // Dead Rising: the console's time base (49.875 MHz), not the host's cycle counter: the
++        // game converts it with KeQueryPerformanceFrequency (x86 TSC ran it ~70x fast, ARM's
++        // 24 MHz counter at half speed).
++        println("\t{}.u64 = PPC_QUERY_TIMEBASE();", r(insn.operands[0]));
+         break;
+ 
+     case PPC_INST_MR:
+@@ -1877,6 +1891,161 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPGTUH:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    // ---- Added for Dead Rising: 16-bit/8-bit VMX ops, CR bit ops, misc ----
++    // Vector registers are stored byte-reversed, so element i of every operand
++    // still lines up and plain per-element operations are endian-safe.
++
++    case PPC_INST_VCMPGTSH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCMPGTSW:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_ps({}.f32), 0xF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCMPEQUH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpeq_epi16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VSLH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = uint16_t({}.u16[{}] << ({}.u16[{}] & 0xF));", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.u16[{}] = uint16_t({}.u16[{}] >> ({}.u16[{}] & 0xF));", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRAH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{}.s16[{}] = int16_t({}.s16[{}] >> ({}.u16[{}] & 0xF));", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRAB:
++        for (size_t i = 0; i < 16; i++)
++            println("\t{}.s8[{}] = int8_t({}.s8[{}] >> ({}.u8[{}] & 0x7));", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VRLH:
++        for (size_t i = 0; i < 8; i++)
++            println("\t{{ uint16_t a = {}.u16[{}]; uint32_t s = {}.u16[{}] & 0xF; {}.u16[{}] = uint16_t((a << s) | (a >> ((16 - s) & 0xF))); }}",
++                v(insn.operands[1]), i, v(insn.operands[2]), i, v(insn.operands[0]), i);
++        break;
++
++    case PPC_INST_VSPLTISH:
++    {
++        int32_t simm = (insn.operands[1] & 0x10) ? int32_t(insn.operands[1] | ~0x1Fu) : int32_t(insn.operands[1] & 0x1F);
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(int16_t({})));", v(insn.operands[0]), simm);
++        break;
++    }
++
++    case PPC_INST_VSUBSHS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_subs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSBS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s8, simde_mm_adds_epi8(simde_mm_load_si128((simde__m128i*){}.s8), simde_mm_load_si128((simde__m128i*){}.s8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        for (size_t i = 0; i < 4; i++)
++            println("\t{{ int64_t t = int64_t({}.s32[{}]) + int64_t({}.s32[{}]); {}.s32[{}] = int32_t(t > INT_MAX ? INT_MAX : t < INT_MIN ? INT_MIN : t); }}",
++                v(insn.operands[1]), i, v(insn.operands[2]), i, v(insn.operands[0]), i);
++        break;
++
++    case PPC_INST_VSUBUBM:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMAXSH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_max_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMINSH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_min_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VAVGUH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_avg_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VANDC:
++        // vD = vA & ~vB
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    // Packs: operands are swapped because of the byte-reversed register layout (see VPKSHUS).
++    case PPC_INST_VPKSWSS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSWUS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_packus_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSHSS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s8, simde_mm_packs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKUHUS:
++        // Sources are unsigned: clamp to 0xFF first so the signed pack cannot misread values >= 0x8000.
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packus_epi16(simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF)), simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF))));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VCTUXS:
++    case PPC_INST_VCFPUXWS128:
++        printSetFlushMode(true);
++        for (size_t i = 0; i < 4; i++)
++            println("\t{{ float f = {}.f32[{}] * {}.0f; {}.u32[{}] = (f != f || f <= 0.0f) ? 0u : f >= 4294967296.0f ? 0xFFFFFFFFu : uint32_t(f); }}",
++                v(insn.operands[1]), i, 1u << insn.operands[2], v(insn.operands[0]), i);
++        break;
++
++    case PPC_INST_BSO:
++        printConditionalBranch(false, "so");
++        break;
++
++    case PPC_INST_BNS:
++        printConditionalBranch(true, "so");
++        break;
++
++    case PPC_INST_BSOLR:
++        println("\tif ({}.so) return;", cr(insn.operands[0]));
++        break;
++
++    case PPC_INST_CROR:
++    case PPC_INST_CRORC:
++    {
++        static constexpr const char* bitNames[] = { "lt", "gt", "eq", "so" };
++        auto crBit = [&](uint32_t bit) { return fmt::format("{}.{}", cr(bit / 4), bitNames[bit % 4]); };
++        bool complement = insn.opcode->id == PPC_INST_CRORC;
++        println("\t{} = {} | {}{};", crBit(insn.operands[0]), crBit(insn.operands[1]), complement ? "!" : "", crBit(insn.operands[2]));
++        break;
++    }
++
++    case PPC_INST_LHBRX:
++        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32));", r(insn.operands[2]));
++        break;
++
++    case PPC_INST_MULHD:
++        println("\t{}.s64 = int64_t(((__int128){}.s64 * (__int128){}.s64) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        break;
++
++    case PPC_INST_MULHDU:
++        println("\t{}.u64 = uint64_t(((unsigned __int128){}.u64 * (unsigned __int128){}.u64) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_VEXPTEFP:
+@@ -2088,6 +2257,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_VSEL:
++    case PPC_INST_VSEL128: // vsel128 vD,vA,vB,vD: same operand order (mask = operands[3])
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
+         break;
+ 
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..676371f 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -5,6 +5,7 @@
+ #error "ppc_config.h must be included before ppc_context.h"
+ #endif
+ 
++#include <chrono>
+ #include <climits>
+ #include <cmath>
+ #include <csetjmp>
+@@ -688,6 +689,17 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+     return simde_mm_castps_si128(simde_mm_insert_ps(simde_mm_castsi128_ps(simde_mm_srl_epi64(a, b)), simde_mm_castsi128_ps(simde_mm_srl_epi64(simde_mm_srli_si128(a, 4), b)), 0x10));
+ }
+ 
++// mftb: the Xbox 360 time base runs at 49.875 MHz (what KeQueryPerformanceFrequency reports), so
++// it is derived from the host's steady clock rather than read from the host's cycle counter.
++#ifndef PPC_QUERY_TIMEBASE
++inline uint64_t PPC_QUERY_TIMEBASE()
++{
++    static const auto start = std::chrono::steady_clock::now();
++    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++    return (ns / 1000000) * 49875 + (ns % 1000000) * 49875 / 1000000;
++}
++#endif
++
+ #if defined(__aarch64__) || defined(_M_ARM64)
+ inline uint64_t __rdtsc()
+ {

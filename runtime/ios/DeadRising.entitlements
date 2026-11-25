@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Entitlements to sign the IPA with (docs/ios.md). Dead Rising reserves the Xbox 360's 4 GB
+     address space, which iOS only allows with extended virtual addressing; keep these when
+     sideloading (Sideloadly advanced options, a paid developer account, or LiveContainer). -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,216 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index 6e9619d..8657c4b 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -2292,7 +2292,8 @@ namespace plume {
+ 
+         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
+         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
+-        setSamplePositions(dstLocation.texture);
++        if (dstLocation.texture != nullptr) // Dead Rising: texture -> buffer (readback) copies have no destination texture
++            setSamplePositions(dstLocation.texture);
+         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
+         resetSamplePositions();
+     }
+@@ -3052,6 +3053,7 @@ namespace plume {
+         assert(desc.pipelineLayout != nullptr);
+ 
+         topology = toD3D12(desc.primitiveTopology);
++        stencilRef = desc.stencilReference; // Dead Rising: set with OMSetStencilRef at draw time (was always 0)
+ 
+         const D3D12PipelineLayout *pipelineLayout = static_cast<const D3D12PipelineLayout *>(desc.pipelineLayout);
+         const D3D12Shader *vertexShader = static_cast<const D3D12Shader *>(desc.vertexShader);
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 194ed7f..30e14ed 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -13,6 +13,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <climits>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
+ #include <unordered_map>
+ 
+ #if DLSS_ENABLED
+@@ -28,6 +31,39 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++    // Dead Rising: the pipeline cache file (empty: no file). See SetVulkanPipelineCachePath.
++    static std::string g_pipelineCachePath;
++
++    void SetVulkanPipelineCachePath(const std::string &path) {
++        g_pipelineCachePath = path;
++    }
++
++    bool SaveVulkanPipelineCache(RenderDevice *device) {
++        auto *vulkanDevice = static_cast<VulkanDevice *>(device);
++        if (vulkanDevice == nullptr || vulkanDevice->pipelineCache == VK_NULL_HANDLE || g_pipelineCachePath.empty()) {
++            return false;
++        }
++        size_t size = 0;
++        if (vkGetPipelineCacheData(vulkanDevice->vk, vulkanDevice->pipelineCache, &size, nullptr) != VK_SUCCESS || size == 0) {
++            return false;
++        }
++        std::vector<char> data(size);
++        if (vkGetPipelineCacheData(vulkanDevice->vk, vulkanDevice->pipelineCache, &size, data.data()) != VK_SUCCESS) {
++            return false;
++        }
++        // Written beside it, then moved over it: a crash or a full disk leaves the old file whole.
++        const std::string temporary = g_pipelineCachePath + ".tmp";
++        {
++            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
++            if (!file.write(data.data(), std::streamsize(size))) {
++                return false;
++            }
++        }
++        std::error_code error;
++        std::filesystem::rename(temporary, g_pipelineCachePath, error);
++        return !error;
++    }
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -1387,7 +1423,7 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.stage = stageInfo;
+ 
+-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -1646,7 +1682,7 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.renderPass = renderPass;
+ 
+-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -3202,6 +3238,8 @@ namespace plume {
+             imageCopy.bufferRowLength = ((srcLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
+             imageCopy.bufferImageHeight = ((srcLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
+             imageCopy.imageSubresource.aspectMask = toAspectFlags(dstTexture->desc.format, dstTexture->desc.flags);
++            if (imageCopy.imageSubresource.aspectMask == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) // Dead Rising: buffer copies take one aspect
++                imageCopy.imageSubresource.aspectMask = RenderFormatSize(srcLocation.placedFootprint.format) == 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+             imageCopy.imageSubresource.baseArrayLayer = dstLocation.subresource.arrayIndex;
+             imageCopy.imageSubresource.layerCount = 1;
+             imageCopy.imageSubresource.mipLevel = dstLocation.subresource.mipLevel;
+@@ -3213,6 +3251,32 @@ namespace plume {
+             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
+             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+         }
++        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
++            // Texture -> buffer (readbacks; Dead Rising: depth resolves, resolve write-back, dumps).
++            assert(srcTexture != nullptr);
++            assert(dstBuffer != nullptr);
++
++            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
++            VkBufferImageCopy imageCopy = {};
++            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
++            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
++            if (imageCopy.imageSubresource.aspectMask == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) // Dead Rising: buffer copies take one aspect
++                imageCopy.imageSubresource.aspectMask = RenderFormatSize(dstLocation.placedFootprint.format) == 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
++            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
++            imageCopy.imageSubresource.layerCount = 1;
++            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
++            if (srcBox != nullptr) {
++                imageCopy.imageOffset = { int32_t(srcBox->left), int32_t(srcBox->top), int32_t(srcBox->front) };
++                imageCopy.imageExtent = { uint32_t(srcBox->right - srcBox->left), uint32_t(srcBox->bottom - srcBox->top), uint32_t(srcBox->back - srcBox->front) };
++            }
++            else {
++                imageCopy.imageOffset = { 0, 0, 0 };
++                imageCopy.imageExtent = { dstLocation.placedFootprint.width, dstLocation.placedFootprint.height, dstLocation.placedFootprint.depth };
++            }
++            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
++        }
+         else {
+             VkImageCopy imageCopy = {};
+             imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+@@ -4137,6 +4201,27 @@ namespace plume {
+         if (!nullDescriptorSupported) {
+             nullBuffer = createBuffer(RenderBufferDesc::DefaultBuffer(16, RenderBufferFlag::VERTEX));
+         }
++
++        // Dead Rising: the pipeline cache, with the last run's data if there is any (the driver
++        // ignores data from another driver or device: the header says which).
++        std::vector<char> cacheData;
++        if (!g_pipelineCachePath.empty()) {
++            std::ifstream file(g_pipelineCachePath, std::ios::binary);
++            if (file) {
++                cacheData.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++            }
++        }
++        VkPipelineCacheCreateInfo cacheInfo = {};
++        cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++        cacheInfo.initialDataSize = cacheData.size();
++        cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
++        if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
++            cacheInfo.initialDataSize = 0;
++            cacheInfo.pInitialData = nullptr;
++            if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
++                pipelineCache = VK_NULL_HANDLE;
++            }
++        }
+     }
+ 
+     VulkanDevice::~VulkanDevice() {
+@@ -4418,6 +4503,11 @@ namespace plume {
+             allocator = VK_NULL_HANDLE;
+         }
+ 
++        if (pipelineCache != VK_NULL_HANDLE) {
++            vkDestroyPipelineCache(vk, pipelineCache, nullptr);
++            pipelineCache = VK_NULL_HANDLE;
++        }
++
+         if (vk != VK_NULL_HANDLE) {
+             vkDestroyDevice(vk, nullptr);
+             vk = VK_NULL_HANDLE;
+@@ -4446,6 +4536,25 @@ namespace plume {
+     VulkanInterface::VulkanInterface() {
+ #endif
+         VkResult res = volkInitialize();
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++        if (res != VK_SUCCESS) {
++            // iOS has no Vulkan loader: MoltenVK is embedded in the app (Frameworks/MoltenVK.framework).
++            void *moltenVK = dlopen("@executable_path/Frameworks/MoltenVK.framework/MoltenVK", RTLD_NOW | RTLD_LOCAL);
++            if (moltenVK == nullptr) {
++                moltenVK = dlopen("MoltenVK.framework/MoltenVK", RTLD_NOW | RTLD_LOCAL);
++            }
++            if (moltenVK != nullptr) {
++                auto getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(moltenVK, "vkGetInstanceProcAddr"));
++                if (getInstanceProcAddr != nullptr) {
++                    volkInitializeCustom(getInstanceProcAddr);
++                    res = VK_SUCCESS;
++                }
++            }
++            else {
++                fprintf(stderr, "MoltenVK could not be loaded: %s\n", dlerror());
++            }
++        }
++#endif
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+             return;
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 73022bb..fb4923f 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -419,6 +419,9 @@ namespace plume {
+         std::unique_ptr<RenderBuffer> nullBuffer;
+         bool loadStoreOpNoneSupported = false;
+         bool nullDescriptorSupported = false;
++        // Dead Rising: one pipeline cache for every pipeline (internally synchronized), filled from
++        // and saved to SetVulkanPipelineCachePath's file.
++        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+ 
+         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
+         ~VulkanDevice() override;

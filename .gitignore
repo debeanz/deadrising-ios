@@ -1,0 +1,17 @@
+﻿# Never commit anything made from the game (docs/ios.md).
+ppc/
+analysis/
+private/
+run/
+run_*/
+build/
+build_*/
+out/
+deps/
+*.xex
+*.arc
+*.exe
+*.dll
+*.log
+*.bmp
+docs/images/
