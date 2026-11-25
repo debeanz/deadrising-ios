@@ -4,6 +4,7 @@
 #include "hang_watchdog.h"
 #include <cpu/ppc_context.h>
 #include <os/logger.h>
+#include <gpu/video.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -145,7 +146,7 @@ namespace
 
             const int64_t last = g_lastPresentMs.load();
             const int64_t stalled = NowMs() - last;
-            if (stalled < kStallMs)
+            if (stalled < kStallMs || Video::RenderingPaused()) // iOS in the background: no stall
             {
                 reports = 0;
                 continue;

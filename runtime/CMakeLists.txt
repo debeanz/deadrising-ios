@@ -206,12 +206,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ios/Launcher.swift"
         COMMENT "Swift: the start screen")
     set_source_files_properties("${DR_LAUNCHER_OBJECT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-    target_sources(DRRecomp PRIVATE "${DR_LAUNCHER_OBJECT}" src/os/ios_launcher.mm)
-    set_source_files_properties(src/os/ios_launcher.mm PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-fobjc-arc")
+    target_sources(DRRecomp PRIVATE "${DR_LAUNCHER_OBJECT}" src/os/ios_launcher.mm src/os/ios_overlay.mm)
+    # Everything that is not the game, in UIKit (src/os/ios_overlay.mm): the controls, Settings, the live log.
+    set_source_files_properties(src/os/ios_launcher.mm src/os/ios_overlay.mm PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-fobjc-arc")
     target_link_options(DRRecomp PRIVATE "-L${DR_IOS_SDK}/usr/lib/swift" "-L${DR_SWIFT_USR}/lib/swift/iphoneos" "-Wl,-rpath,/usr/lib/swift")
     find_library(DR_UIKIT UIKit REQUIRED)
     find_library(DR_SWIFTUI SwiftUI REQUIRED)
-    target_link_libraries(DRRecomp PRIVATE ${DR_UIKIT} ${DR_SWIFTUI})
+    find_library(DR_QUARTZCORE QuartzCore REQUIRED)
+    target_link_libraries(DRRecomp PRIVATE ${DR_UIKIT} ${DR_SWIFTUI} ${DR_QUARTZCORE})
     if (DR_MOLTENVK_FRAMEWORK)
         add_custom_command(TARGET DRRecomp POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:DRRecomp>/Frameworks"

@@ -11,6 +11,9 @@
 #include <user/config.h>
 
 #include <SDL.h>
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include <os/ios_overlay.h>
+#endif
 
 #include <functional>
 #include <string>
@@ -19,6 +22,16 @@
 namespace
 {
     constexpr uint32_t kWidth = 1280, kHeight = 720;
+
+    // iPhone / iPad: everything that is not the game is UIKit (os/ios_overlay.mm), whatever the game's frame rate:
+    // this menu, its status panel and live log are never drawn there; F1 and Start + Back open the native Settings.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    constexpr bool kNativeUi = true;
+    void ToggleNativeSettings() { Overlay::ToggleSettings(); }
+#else
+    constexpr bool kNativeUi = false;
+    void ToggleNativeSettings() {}
+#endif
 
     enum : uint16_t
     {
@@ -354,6 +367,16 @@ namespace
 
 bool OptionsMenu::HandleEvent(const SDL_Event& event)
 {
+    if constexpr (kNativeUi)
+    {
+        if (event.type == SDL_KEYDOWN && !event.key.repeat && event.key.keysym.scancode == SDL_SCANCODE_F1)
+        {
+            LOGN("[options] F1 pressed");
+            ToggleNativeSettings();
+            return true;
+        }
+        return false;
+    }
     if (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERMOTION || event.type == SDL_FINGERUP)
         return HandleFinger(event.tfinger, event.type);
     if (event.type != SDL_KEYDOWN || event.key.repeat)
@@ -378,6 +401,16 @@ bool OptionsMenu::HandleEvent(const SDL_Event& event)
 
 void OptionsMenu::Update()
 {
+    if constexpr (kNativeUi)
+    {
+        if (g_comboOpen)
+        {
+            g_comboOpen = false;
+            LOGN("[options] Start + Back pressed");
+            ToggleNativeSettings();
+        }
+        return;
+    }
     static uint32_t logRefresh = 0;
     if (g_logView && !g_open && ++logRefresh % 15 == 0)
         Redraw(); // new log lines
@@ -457,7 +490,7 @@ void OptionsMenu::Update()
 
 void OptionsMenu::SetStatus(const std::string& headline)
 {
-    if (headline.empty() && g_status.empty())
+    if (kNativeUi || (headline.empty() && g_status.empty()))
         return;
     g_status = headline;
     Redraw(); // the log lines change too
@@ -465,6 +498,8 @@ void OptionsMenu::SetStatus(const std::string& headline)
 
 bool OptionsMenu::Visible()
 {
+    if constexpr (kNativeUi)
+        return false;
     return g_open || Config::ShowFps || !g_status.empty() || g_logView;
 }
 
@@ -528,6 +563,8 @@ uint16_t OptionsMenu::FilterButtons(uint16_t raw)
 void OptionsMenu::SetFps(double fps)
 {
     g_fps = fps;
+    if constexpr (kNativeUi)
+        return;
     const int rounded = int(fps + 0.5);
     if (rounded != g_shownFps)
     {

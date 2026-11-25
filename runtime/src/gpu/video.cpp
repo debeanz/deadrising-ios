@@ -10,12 +10,18 @@
 #include <user/config.h>
 #include <os/logger.h>
 #include <profiler/cpu_sampler.h>
+#include <os/hang_watchdog.h>
 
 #include <SDL.h>
 #include <SDL_syswm.h>
 #ifdef __APPLE__
 #include <SDL_metal.h>
 #include <plume_apple.h>
+#if TARGET_OS_IPHONE
+#include <CoreFoundation/CoreFoundation.h>
+#include <pthread.h>
+#include <os/ios_overlay.h>
+#endif
 #endif
 #include <plume_render_interface.h>
 
@@ -342,20 +348,42 @@ namespace
         snprintf(title, sizeof(title),
             "Dead Rising (recompiled) [%s] - frame %u, %.0f fps | draws %u, vertex batches %u, clears %u, resolves %u, tiles %u, textures %u",
             g_host.apiName, stats.frame, fps, stats.draws, stats.vertexBatches, stats.clears, stats.resolves, stats.tiles, stats.textureBinds);
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE) // no title on iOS (and SDL's window belongs to the main thread there)
         SDL_SetWindowTitle(g_window, title);
+#endif
 
         static uint32_t updates;
         if (updates++ % 10 == 0) // every ~5 s
             LOGFN("[video] {}", title);
     }
 
-    void VideoThread()
+    // iPhone / iPad: the main thread keeps UIKit, SDL's events and the controllers (and with them the native
+    // controls, Settings and live log, os/ios_overlay.mm), and the game is rendered on a thread of its own, so
+    // nothing outside the game waits for its frames. On other systems one video thread does both.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    constexpr bool kRenderThread = true;
+#else
+    constexpr bool kRenderThread = false;
+#endif
+
+    std::atomic<uint32_t> g_gameFrames{ 0 };      // pictures the game has shown
+    std::atomic<int64_t> g_lastGameFrameNs{ 0 };  // when the last one came (steady clock)
+    std::atomic<double> g_fps{ 0.0 };
+    std::atomic<uint32_t> g_videoFrames{ 0 };     // frames presented (DR_AUTO_INPUT counts them)
+    std::atomic<bool> g_appActive{ true };        // iOS: no GPU work while the app is in the background
+    const std::chrono::steady_clock::time_point g_videoStart = std::chrono::steady_clock::now();
+
+    int64_t SteadyNs(std::chrono::steady_clock::time_point time)
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+    }
+
+    bool CreateWindowAndDevice()
     {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0)
         {
             LOGFN_ERROR("[video] SDL_Init failed: {}", SDL_GetError());
-            g_initDone = true;
-            return;
+            return false;
         }
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -369,158 +397,269 @@ namespace
         if (g_window == nullptr || !CreateHostDevice())
         {
             LOGFN_ERROR("[video] could not create the window or GPU device: {}", SDL_GetError());
-            g_initDone = true;
-            return;
+            return false;
         }
 
         LOGFN("[video] window and {} device ready", g_host.apiName);
         Input::Init();
+        return true;
+    }
+
+    void InitRenderer()
+    {
         if (!Shaders::Init(g_host.device.get(), strncmp(g_host.apiName, "Vulkan", 6) == 0))
             LOGN_ERROR("[video] shader cache unavailable - shaders will not be translated");
         else
             g_rendererReady = Renderer::Init(g_host.device.get(), strncmp(g_host.apiName, "Vulkan", 6) == 0, kSwapChainFormat);
-        g_initOk = true;
-        g_initDone = true;
-        if (g_startGame != nullptr)
-            g_startGame();
+    }
 
-        auto lastTitle = std::chrono::steady_clock::now();
-        uint32_t framesSinceTitle = 0;
-        CpuSampler::RegisterCurrentThread("video thread"); // DR_CPU_PROFILE=1
-
-        g_stageMark = std::chrono::steady_clock::now();
-        while (true)
+    // SDL's events, the controllers and the options menu, on the thread that made the window. timed: the time
+    // goes into the video thread's hitch breakdown (not on iOS, where this is the main thread).
+    void PumpEvents(bool timed)
+    {
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
         {
-            SDL_Event event;
-            while (SDL_PollEvent(&event))
+            if (timed)
             {
                 g_stageEvents++;
                 if (event.type == SDL_JOYDEVICEADDED || event.type == SDL_JOYDEVICEREMOVED || event.type == SDL_CONTROLLERDEVICEADDED ||
                     event.type == SDL_CONTROLLERDEVICEREMOVED || event.type == SDL_CONTROLLERDEVICEREMAPPED)
                     g_stageDeviceEvents++;
-                if (event.type == SDL_WINDOWEVENT)
-                {
-                    g_stageWindowEvents++;
-                    const char* what = event.window.event == SDL_WINDOWEVENT_FOCUS_LOST ? "lost focus"
-                        : event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ? "got focus"
-                        : event.window.event == SDL_WINDOWEVENT_MINIMIZED ? "minimized"
-                        : event.window.event == SDL_WINDOWEVENT_RESTORED ? "restored" : nullptr;
-                    static uint32_t logged;
-                    if (what != nullptr && logged++ < 100)
-                        LOGFN("[video] window {}", what);
-                }
-                if (OptionsMenu::HandleEvent(event))
-                    continue;
-                Input::HandleEvent(event);
-                if (event.type == SDL_QUIT)
-                {
-                    LOGN("[video] window closed - exiting");
-                    SaveVulkanPipelines(true);
-                    std::_Exit(0);
-                }
             }
-
+            if (event.type == SDL_WINDOWEVENT)
+            {
+                if (timed)
+                    g_stageWindowEvents++;
+                const char* what = event.window.event == SDL_WINDOWEVENT_FOCUS_LOST ? "lost focus"
+                    : event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ? "got focus"
+                    : event.window.event == SDL_WINDOWEVENT_MINIMIZED ? "minimized"
+                    : event.window.event == SDL_WINDOWEVENT_RESTORED ? "restored" : nullptr;
+                static uint32_t logged;
+                if (what != nullptr && logged++ < 100)
+                    LOGFN("[video] window {}", what);
+            }
+            if (OptionsMenu::HandleEvent(event))
+                continue;
+            Input::HandleEvent(event);
+            if (event.type == SDL_QUIT)
+            {
+                LOGN("[video] window closed - exiting");
+                if (!kRenderThread)
+                    SaveVulkanPipelines(true); // iOS: the render thread saves it when the app leaves the screen
+                std::_Exit(0);
+            }
+        }
+        if (timed)
             MarkStage(StageEvents);
 
-            static uint32_t videoFrames;
-            Input::Update(videoFrames);
-            OptionsMenu::Update();
+        Input::Update(g_videoFrames.load(std::memory_order_relaxed));
+        OptionsMenu::Update();
 
-            // Settings the window and swap chain carry (user/config.h).
-            static bool fullscreen = false;
-            if (Config::Fullscreen != fullscreen)
-            {
-                fullscreen = Config::Fullscreen;
-                SDL_SetWindowFullscreen(g_window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-            }
-            if (g_host.swapChain != nullptr && g_host.swapChain->isVsyncEnabled() != Config::VSync)
-                g_host.swapChain->setVsyncEnabled(Config::VSync);
-            MarkStage(StageInput);
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
+        // Settings the window carries (user/config.h).
+        static bool fullscreen = false;
+        if (Config::Fullscreen != fullscreen)
+        {
+            fullscreen = Config::Fullscreen;
+            SDL_SetWindowFullscreen(g_window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        }
+#endif
+    }
 
-            Video::FrameStats stats;
-            bool gameFrame = false;
+    // One turn of the render loop: waits up to 50 ms for the game's next frame and presents it.
+    void RenderStep()
+    {
+        // iOS: GPU work from an app in the background gets it killed. The game waits meanwhile (renderer.cpp).
+        static bool paused = false;
+        if (!g_appActive.load())
+        {
+            if (!paused)
             {
-                std::unique_lock lock(g_frameMutex);
-                g_frameReady.wait_for(lock, std::chrono::milliseconds(50), [] { return g_framePending; });
-                g_stageMark = std::chrono::steady_clock::now(); // waiting for the game is not this thread's time
-                if (g_framePending)
-                {
-                    stats = g_pendingStats;
-                    g_framePending = false;
-                    gameFrame = true;
-                }
+                paused = true;
+                WaitAll();
+                SaveVulkanPipelines(true); // the app may not come back
+                LOGN("[video] the app left the screen: rendering paused");
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            g_stageMark = std::chrono::steady_clock::now();
+            return;
+        }
+        if (paused)
+        {
+            paused = false;
+            LOGN("[video] the app is back: rendering again");
+        }
 
-            // No picture from the game for 2 s (starting, a long load, or stuck): the status panel
-            // (ui/options_menu.cpp: what is happening and the log's last lines) over the last picture
-            // or black, 5 times a second, with the touch controls and the options menu working. The
-            // iPhone build showed nothing at all while the game hung before its first frame.
-            static auto lastGameFrame = std::chrono::steady_clock::now();
-            static auto lastStatusFrame = lastGameFrame;
-            static Video::FrameStats lastStats;
-            const auto loopNow = std::chrono::steady_clock::now();
-            if (gameFrame)
-            {
-                lastGameFrame = loopNow;
-                lastStats = stats;
-                OptionsMenu::SetStatus({});
-            }
-            else
-            {
-                const double waited = std::chrono::duration<double>(loopNow - lastGameFrame).count();
-                if (waited < 2.0 || loopNow - lastStatusFrame < std::chrono::milliseconds(200))
-                    continue; // keep the window responsive while the game loads
-                lastStatusFrame = loopNow;
-                OptionsMenu::SetStatus(fmt::format("{} {:.0f} s", lastStats.frame == 0 ? "The game has not shown a picture yet:" :
-                    "No new picture from the game for", waited));
-                RenderFrame(lastStats);
-                continue;
-            }
+        if (g_host.swapChain != nullptr && g_host.swapChain->isVsyncEnabled() != Config::VSync)
+            g_host.swapChain->setVsyncEnabled(Config::VSync);
+        MarkStage(StageInput);
 
-            RenderFrame(stats);
-            videoFrames++;
-            framesSinceTitle++;
-
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - lastTitle).count();
-            if (elapsed >= 0.5)
+        Video::FrameStats stats;
+        bool gameFrame = false;
+        {
+            std::unique_lock lock(g_frameMutex);
+            g_frameReady.wait_for(lock, std::chrono::milliseconds(50), [] { return g_framePending; });
+            g_stageMark = std::chrono::steady_clock::now(); // waiting for the game is not this thread's time
+            if (g_framePending)
             {
-                UpdateTitle(stats, framesSinceTitle / elapsed);
-                OptionsMenu::SetFps(framesSinceTitle / elapsed);
-                Shaders::Update();
-                SaveVulkanPipelines(false);
-                lastTitle = now;
-                framesSinceTitle = 0;
+                stats = g_pendingStats;
+                g_framePending = false;
+                gameFrame = true;
             }
-            MarkStage(StageTitle);
+        }
 
-            uint32_t totalUs = 0;
-            for (uint32_t us : g_stageUs)
-                totalUs += us;
-            if (totalUs > 50000)
+        // No picture from the game for 2 s (starting, a long load, or stuck): the status panel
+        // (ui/options_menu.cpp: what is happening and the log's last lines) over the last picture
+        // or black, 5 times a second, with the options menu working. iOS shows its own live log
+        // instead (os/ios_overlay.mm), without the game's renderer.
+        static auto lastGameFrame = std::chrono::steady_clock::now();
+        static auto lastStatusFrame = lastGameFrame;
+        static Video::FrameStats lastStats;
+        const auto loopNow = std::chrono::steady_clock::now();
+        if (gameFrame)
+        {
+            lastGameFrame = loopNow;
+            lastStats = stats;
+            g_gameFrames.fetch_add(1, std::memory_order_relaxed);
+            g_lastGameFrameNs.store(SteadyNs(loopNow), std::memory_order_relaxed);
+            OptionsMenu::SetStatus({});
+        }
+        else
+        {
+            if (kRenderThread)
+                return;
+            const double waited = std::chrono::duration<double>(loopNow - lastGameFrame).count();
+            if (waited < 2.0 || loopNow - lastStatusFrame < std::chrono::milliseconds(200))
+                return; // keep the window responsive while the game loads
+            lastStatusFrame = loopNow;
+            OptionsMenu::SetStatus(fmt::format("{} {:.0f} s", lastStats.frame == 0 ? "The game has not shown a picture yet:" :
+                "No new picture from the game for", waited));
+            RenderFrame(lastStats);
+            return;
+        }
+
+        RenderFrame(stats);
+        const uint32_t videoFrame = g_videoFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        static auto lastTitle = std::chrono::steady_clock::now();
+        static uint32_t framesSinceTitle = 0;
+        framesSinceTitle++;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - lastTitle).count();
+        if (elapsed >= 0.5)
+        {
+            const double fps = framesSinceTitle / elapsed;
+            UpdateTitle(stats, fps);
+            g_fps.store(fps, std::memory_order_relaxed);
+            OptionsMenu::SetFps(fps);
+            Shaders::Update();
+            SaveVulkanPipelines(false);
+            lastTitle = now;
+            framesSinceTitle = 0;
+        }
+        MarkStage(StageTitle);
+
+        uint32_t totalUs = 0;
+        for (uint32_t us : g_stageUs)
+            totalUs += us;
+        if (totalUs > 50000)
+        {
+            static uint32_t logged;
+            if (logged++ < 200)
             {
-                static uint32_t logged;
-                if (logged++ < 200)
-                {
-                    std::string stages;
-                    for (uint32_t i = 0; i < StageCount; i++)
-                        if (g_stageUs[i] >= 1000)
-                            stages += fmt::format("{}{} {} ms", stages.empty() ? "" : ", ", kVideoStageNames[i], g_stageUs[i] / 1000);
-                    LOGFN("[hitch] video thread, frame {}: {} ms busy ({}); {} SDL events, {} controller connects, {} window events",
-                        videoFrames, totalUs / 1000, stages, g_stageEvents, g_stageDeviceEvents, g_stageWindowEvents);
-                }
+                std::string stages;
+                for (uint32_t i = 0; i < StageCount; i++)
+                    if (g_stageUs[i] >= 1000)
+                        stages += fmt::format("{}{} {} ms", stages.empty() ? "" : ", ", kVideoStageNames[i], g_stageUs[i] / 1000);
+                LOGFN("[hitch] video thread, frame {}: {} ms busy ({}); {} SDL events, {} controller connects, {} window events",
+                    videoFrame, totalUs / 1000, stages, g_stageEvents, g_stageDeviceEvents, g_stageWindowEvents);
             }
-            for (uint32_t& us : g_stageUs)
-                us = 0;
-            g_stageEvents = g_stageDeviceEvents = g_stageWindowEvents = 0;
+        }
+        for (uint32_t& us : g_stageUs)
+            us = 0;
+        g_stageEvents = g_stageDeviceEvents = g_stageWindowEvents = 0;
+    }
+
+    void RenderLoop()
+    {
+        CpuSampler::RegisterCurrentThread(kRenderThread ? "render thread" : "video thread"); // DR_CPU_PROFILE=1
+        g_stageMark = std::chrono::steady_clock::now();
+        while (true)
+        {
+            if (!kRenderThread)
+                PumpEvents(true);
+            RenderStep();
         }
     }
+
+    void VideoThread()
+    {
+        if (!CreateWindowAndDevice())
+        {
+            g_initDone = true;
+            return;
+        }
+        InitRenderer();
+        g_initOk = true;
+        g_initDone = true;
+        if (g_startGame != nullptr)
+            g_startGame();
+        RenderLoop();
+    }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    void* RenderThreadMain(void*)
+    {
+        pthread_setname_np("render");
+        InitRenderer();
+        g_initOk = true;
+        g_initDone = true;
+        if (g_startGame != nullptr)
+            g_startGame();
+        RenderLoop();
+        return nullptr;
+    }
+#endif
 }
 
 void Video::RunOnMainThread(void (*startGame)())
 {
     g_startGame = startGame;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (!CreateWindowAndDevice())
+    {
+        g_initDone = true;
+        return;
+    }
+    Overlay::Create(g_window); // above the game's Metal view, made with the device
+
+    // The renderer's thread: a big stack, as the main thread had (secondary threads get 512 KB on iOS).
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16 * 1024 * 1024);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, RenderThreadMain, nullptr) != 0)
+    {
+        LOGN_ERROR("[video] could not start the render thread");
+        pthread_attr_destroy(&attr);
+        return;
+    }
+    pthread_attr_destroy(&attr);
+    pthread_detach(thread);
+    LOGN("[video] rendering on its own thread; the main thread keeps UIKit, events and the controllers");
+
+    // The main thread: UIKit (the overlay's touches, display links and animations), SDL's events and the
+    // controllers, about 240 times a second whatever the game's frame rate. The run loop sleeps until
+    // something comes in or 4 ms pass.
+    while (true)
+    {
+        PumpEvents(false);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.004, true);
+    }
+#else
     VideoThread();
+#endif
 }
 
 bool Video::Init()
@@ -539,4 +678,36 @@ void Video::SubmitFrame(const FrameStats& stats)
         g_framePending = true;
     }
     g_frameReady.notify_one();
+}
+
+uint32_t Video::GameFrames()
+{
+    return g_gameFrames.load(std::memory_order_relaxed);
+}
+
+double Video::SecondsSinceGameFrame()
+{
+    const int64_t last = g_lastGameFrameNs.load(std::memory_order_relaxed);
+    const int64_t since = last != 0 ? last : SteadyNs(g_videoStart);
+    return double(SteadyNs(std::chrono::steady_clock::now()) - since) / 1e9;
+}
+
+double Video::Fps()
+{
+    return g_fps.load(std::memory_order_relaxed);
+}
+
+void Video::SetAppActive(bool active)
+{
+    if (g_appActive.exchange(active) == active)
+        return;
+    // The time away is no stall: the next frame counts from now (os/hang_watchdog.cpp).
+    g_lastGameFrameNs.store(SteadyNs(std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    HangWatchdog::OnPresent();
+    g_frameReady.notify_one();
+}
+
+bool Video::RenderingPaused()
+{
+    return !g_appActive.load(std::memory_order_relaxed);
 }

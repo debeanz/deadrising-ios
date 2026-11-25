@@ -63,7 +63,7 @@ struct Event final : KernelObject, HostObject<XKEVENT>
                 while (true)
                 {
                     bool expected = true;
-                    if (signaled.compare_exchange_weak(expected, false))
+                    if (signaled.compare_exchange_strong(expected, false))
                         break;
 
                     Park::WaitWhile(&signaled, [&] { return !signaled.load(); });
@@ -124,7 +124,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
             uint32_t currentCount = count.load();
             if (currentCount != 0)
             {
-                if (count.compare_exchange_weak(currentCount, currentCount - 1))
+                if (count.compare_exchange_strong(currentCount, currentCount - 1))
                     return STATUS_SUCCESS;
             }
 
@@ -138,7 +138,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
                 currentCount = count.load();
                 if (currentCount != 0)
                 {
-                    if (count.compare_exchange_weak(currentCount, currentCount - 1))
+                    if (count.compare_exchange_strong(currentCount, currentCount - 1))
                         return STATUS_SUCCESS;
                 }
                 else
@@ -800,13 +800,18 @@ void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
     {
         uint32_t previousOwner = 0;
 
-        if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
+        // Strong: a weak compare-exchange may fail on ARM with the lock free (previousOwner 0), and
+        // waiting for the owner to change from 0 then slept for good: the iPhone build's freezes in
+        // RtlEnterCriticalSection (2026-11-25). x86 never fails spuriously.
+        if (owningThread.compare_exchange_strong(previousOwner, thisThread) || previousOwner == thisThread)
         {
             if (waiting)
                 StopWaiting(cs);
             cs->RecursionCount++;
             return;
         }
+        if (previousOwner == 0)
+            continue; // released in between: try again
 
         if (!waiting)
         {
@@ -1321,7 +1326,7 @@ bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 
     uint32_t previousOwner = 0;
 
-    if (owningThread.compare_exchange_weak(previousOwner, thisThread) || previousOwner == thisThread)
+    if (owningThread.compare_exchange_strong(previousOwner, thisThread) || previousOwner == thisThread)
     {
         cs->RecursionCount++;
         return true;

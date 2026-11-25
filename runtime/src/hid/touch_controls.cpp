@@ -125,7 +125,7 @@ namespace
 void TouchControls::Init()
 {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-    g_enabled = true;
+    g_enabled = false; // iPhone / iPad: native controls in UIKit (os/ios_overlay.mm), not drawn by the renderer
 #else
     g_enabled = getenv("DR_TOUCH") != nullptr;
     if (g_enabled)

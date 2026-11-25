@@ -5,6 +5,7 @@
 #include <stdafx.h>
 #include <profiler/hitch_stats.h>
 #include "renderer.h"
+#include "video.h"
 #include <apu/audio.h>
 #include <ui/options_menu.h>
 #include <user/config.h>
@@ -3244,8 +3245,11 @@ void Renderer::OnPresent(uint32_t device)
         // window cannot hang the game).
         std::unique_lock lock(g_frameMutex);
         const auto waitStart = std::chrono::steady_clock::now();
+        // iOS in the background: rendering is paused (gpu/video.cpp), and the game waits with it.
         if (g_rendererActive)
-            g_frameTaken.wait_for(lock, std::chrono::seconds(1), [] { return !g_pendingValid; });
+            while (!g_frameTaken.wait_for(lock, std::chrono::seconds(1), [] { return !g_pendingValid; }) && Video::RenderingPaused())
+            {
+            }
         const uint32_t waitUs = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count());
         g_timing.guestWaitUs += waitUs;
         // Game time stands still while a frame stalls (fixed step): log the long ones, with where
