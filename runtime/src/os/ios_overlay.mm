@@ -1177,3 +1177,19 @@ bool IosGpu::SupportsBCTextures()
         return false;
     }
 }
+
+int IosGpu::ThermalState()
+{
+    @autoreleasepool
+    {
+        return int([NSProcessInfo processInfo].thermalState); // nominal, fair, serious, critical
+    }
+}
+
+bool IosGpu::LowPowerMode()
+{
+    @autoreleasepool
+    {
+        return [NSProcessInfo processInfo].lowPowerModeEnabled;
+    }
+}

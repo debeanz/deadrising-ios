@@ -15,3 +15,14 @@ inline void SetThreadInteractive()
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 }
+
+// Names this thread for the per-thread CPU report ("[cpu] threads", profiler/cpu_sampler.cpp; Apple only, 63
+// characters at most). Call on the thread itself.
+inline void NameThisThread(const char* name)
+{
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#else
+    (void)name;
+#endif
+}

@@ -66,6 +66,11 @@ static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
 #endif
     SetThreadInteractive(); // os/thread_qos.h: the fast cores on iPhone / iPad
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "game sub_%08X", hThread->params.function); // the thread's entry point
+        NameThisThread(name);
+    }
     Park::WaitWhile(&hThread->suspended, [&] { return hThread->suspended.load(); }); // kernel/park.h
     GuestThread::Start(hThread->params);
 #ifdef USE_PTHREAD

@@ -196,6 +196,43 @@ door stayed white). Build 23:
   thread, the render thread and the command processor, functions by self and total time
   (`profiler/cpu_sampler.cpp`; `DR_HITCH_PROFILE=0` off). The next step for the draw hooks comes from these.
 
+Build 23 on the iPhone 15 (720p, 60 fps setting): 21-61 fps and a hot phone. The `[cpu]` profile showed a chain of
+waits, not too much work: the game thread spent 85% of its time in D3D's spin-wait for the GPU (`sub_8244B050`,
+which turns `sub_8244ED10`: 32 `db16cyc`, then the GPU's read pointer), the command processor 90% waiting for the
+vblank (`WAIT_REG_MEM` on the swap flag the vblank handler clears), the render thread 90% idle. The spin kept a fast
+core at full power for about 12 ms of every frame. Pipelines still being made skipped up to 29,000 draws in 300
+frames (objects appearing and disappearing). Build 24:
+
+* D3D's spin-wait sleeps: each turn of `sub_8244ED10` first waits until the command processor moves on
+  (`CommandProcessor::WaitForProgress`: a batch done and its read pointer written back, a fence or memory write, a
+  `WAIT_REG_MEM` reached, a vblank) or 1 ms passes. On the PC (D3D12, title, 60 fps) the process used 145% of one
+  core with the spin and 63-87% without, frame times the same. `DR_GPU_SPIN=1` spins as before.
+* Pipelines kept between runs: every pipeline made is recorded (shader hashes, vertex layout, state; found by what
+  it is, `PipelineHash`) in `_recomp_cache/pipelines_<api>.bin` next to the settings, and the next run makes them
+  all in the background from the start, during the logos (`DR_PIPELINE_LIST=0` off). The first run of a new build
+  records; the runs after it find the pipelines ready. iPhone / iPad: 5 pipeline threads (were 3).
+* New colour targets start black (a clear ahead of the game's own, their first pass's CLEAR load operation)
+  instead of whatever the memory held, a candidate for the pink flash as the game started
+  (`DR_FRESH_TARGET_CLEAR=0` off).
+* The vblank timer, the audio mixer and the XMA decoder ask for the fast cores too.
+
+Cutscene sound: the dialogue plays in real time, the pictures move by the game's step. At 60 fps the step is the
+measured frame time (`mDeltaTime`, docs/frame_rate.md), so a cutscene keeps time on average, but frames of 50-90
+ms (build 23 had many) move it in jumps, which looks like the voices running ahead. The `[perf]` frame-time line
+counts them.
+
+Logs for the next round (all in the four-finger log and the shared file):
+
+* `[perf]` every 5 s: frames presented, game swaps and vblanks (late ones), the process's CPU use; the game's frame
+  times (up to 20, 20-36, 36-52, over 52 ms, the longest); how long the game waits for the GPU and the GPU for the
+  CPU (and how many of those waits ended at a vblank, i.e. vsync); the render thread's stages; pipelines made (and
+  how long each took), still queued, draws skipped; the audio mixer (runs, late runs, the device queue: average,
+  lowest, nearly empty), XMA decode times; on iPhone / iPad the thermal state (iOS slows the device from
+  "serious") and Low Power Mode.
+* `[cpu] threads` every 10 s (Apple): every thread's share of one core by name (game threads by their entry
+  point, `game sub_XXXXXXXX`), with the app's share of time on the performance cores, the GPU's busy time, wakeups
+  a second and the energy counter. With the `[cpu]` profiles this says which thread spends the power.
+
 ## Screen scaling and widescreen
 
 Screen Scaling (start screen and Settings; `ScreenScaling` in recomp_config.toml): Fit (the game's

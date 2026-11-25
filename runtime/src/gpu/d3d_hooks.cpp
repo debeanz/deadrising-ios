@@ -18,6 +18,8 @@
 #include <patches/enemy_trace.h>
 #include <user/config.h>
 #include <kernel/heap.h>
+#include <os/perf.h>
+#include "command_processor.h"
 
 namespace
 {
@@ -966,4 +968,53 @@ PPC_FUNC(sub_82452860)
     const uint32_t elements = ctx.r3.u32;
     __imp__sub_82452860(ctx, base);
     Renderer::OnCreateVertexDeclaration(elements, ctx.r3.u32);
+}
+
+// ---- The game waiting for the GPU (the "[perf]" report, os/perf.h). D3D spins in sub_8244B050 (sub_8244ED10 in a
+// loop) until the GPU frees ring space or passes a fence. On the iPhone the game thread spent 85% of its time there
+// (2026-11-25, "[cpu]"): the frame is paced by the GPU's vblank waits, not by the game's own work.
+namespace
+{
+    std::atomic<uint64_t> g_gpuWaitCalls{ 0 }, g_gpuWaitNs{ 0 }, g_gpuWaitMaxNs{ 0 };
+}
+
+#ifndef DR_CALL_PROFILER // it wraps every function itself
+PPC_FUNC_IMPL(__imp__sub_8244B050);
+PPC_FUNC(sub_8244B050)
+{
+    const auto start = std::chrono::steady_clock::now();
+    __imp__sub_8244B050(ctx, base);
+    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    g_gpuWaitCalls.fetch_add(1, std::memory_order_relaxed);
+    g_gpuWaitNs.fetch_add(ns, std::memory_order_relaxed);
+    uint64_t current = g_gpuWaitMaxNs.load(std::memory_order_relaxed);
+    while (ns > current && !g_gpuWaitMaxNs.compare_exchange_weak(current, ns, std::memory_order_relaxed))
+    {
+    }
+}
+
+// One turn of D3D's spin-wait for the GPU (32 db16cyc, then the GPU's read pointer and a 5 s hang check). An Xbox 360
+// spins on a hardware thread of its own; here it kept a whole core busy for about 12 ms of every frame (2026-11-25,
+// iPhone: 85% of the game thread, the phone hot). Each turn now first sleeps until the command processor moves on
+// (CommandProcessor::WaitForProgress) or 1 ms passes. DR_GPU_SPIN=1: spin as before.
+PPC_FUNC_IMPL(__imp__sub_8244ED10);
+PPC_FUNC(sub_8244ED10)
+{
+    static const bool spin = getenv("DR_GPU_SPIN") != nullptr && atoi(getenv("DR_GPU_SPIN")) != 0;
+    if (!spin)
+    {
+        thread_local uint64_t seen = 0;
+        CommandProcessor::WaitForProgress(seen, std::chrono::microseconds(1000));
+    }
+    __imp__sub_8244ED10(ctx, base);
+}
+#endif
+
+Perf::GameWait Perf::TakeGameGpuWait()
+{
+    GameWait w;
+    w.calls = g_gpuWaitCalls.exchange(0);
+    w.ns = g_gpuWaitNs.exchange(0);
+    w.maxNs = g_gpuWaitMaxNs.exchange(0);
+    return w;
 }

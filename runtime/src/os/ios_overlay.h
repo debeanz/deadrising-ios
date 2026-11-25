@@ -19,4 +19,9 @@ namespace IosGpu
     // Whether the GPU can sample the BC (DXT) formats (Metal's supportsBCTextureCompression: Macs and iPads
     // with an M chip; iPhones mostly not). Without them the textures are decoded on the CPU (gpu/texture_decode.h).
     bool SupportsBCTextures();
+
+    // For the "[perf]" report (gpu/video.cpp): the device's thermal state (0 nominal, 1 fair, 2 serious, 3 critical: iOS
+    // slows the CPU and GPU from 2) and whether Low Power Mode is on (also slower). Any thread.
+    int ThermalState();
+    bool LowPowerMode();
 }

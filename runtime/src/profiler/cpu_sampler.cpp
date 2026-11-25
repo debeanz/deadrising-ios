@@ -502,7 +502,7 @@ void CpuSampler::LogStack(const void* context)
 // where. DR_HITCH_PROFILE=0 turns it off. Nothing is allocated or locked while a thread is stopped.
 namespace
 {
-    constexpr int kThreads = 6, kMaxDepth = 40;
+    constexpr int kThreads = 8, kMaxDepth = 40;
     constexpr uintptr_t kAddressMask = 0x0000000FFFFFFFFFull; // no pointer authentication bits
 
     struct Watched
@@ -606,8 +606,109 @@ namespace
         LOGFN("[cpu] {}: total {}", watched.name, top(total, 22));
     }
 
+    // Every thread of the app, every 10 s: its share of one core over the period ("[cpu] threads"), by name (the
+    // watched threads' names, else the thread's own: os/thread_qos.h NameThisThread). With the whole app's: CPU time
+    // in all, the part of it on the performance cores, the GPU's busy time, wakeups and the energy counter. 2026-11-25:
+    // the iPhone got hot at 30-60 fps; this says which thread spends the power, and whether it is CPU or GPU.
+    void ReportThreads(std::unordered_map<uint64_t, uint64_t>& last, double seconds)
+    {
+        thread_act_array_t list = nullptr;
+        mach_msg_type_number_t count = 0;
+        if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS)
+            return;
+        const bool first = last.empty();
+        const mach_port_t mainThread = pthread_mach_thread_np(pthread_main_thread_np());
+        std::unordered_map<uint64_t, uint64_t> now;
+        std::unordered_map<std::string, std::pair<uint64_t, uint32_t>> byName; // ns, threads
+        uint64_t allNs = 0;
+        for (mach_msg_type_number_t i = 0; i < count; i++)
+        {
+            thread_identifier_info_data_t id{};
+            mach_msg_type_number_t idCount = THREAD_IDENTIFIER_INFO_COUNT;
+            thread_extended_info_data_t info{};
+            mach_msg_type_number_t infoCount = THREAD_EXTENDED_INFO_COUNT;
+            if (thread_info(list[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id), &idCount) == KERN_SUCCESS &&
+                thread_info(list[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&info), &infoCount) == KERN_SUCCESS)
+            {
+                thread_basic_info_data_t basic{};
+                mach_msg_type_number_t basicCount = THREAD_BASIC_INFO_COUNT;
+                if (thread_info(list[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic), &basicCount) != KERN_SUCCESS)
+                    basic = {};
+                const uint64_t ns = (uint64_t(basic.user_time.seconds) + uint64_t(basic.system_time.seconds)) * 1000000000ull +
+                    (uint64_t(basic.user_time.microseconds) + uint64_t(basic.system_time.microseconds)) * 1000ull;
+                now[id.thread_id] = ns;
+                auto it = last.find(id.thread_id);
+                const uint64_t delta = it != last.end() ? (ns > it->second ? ns - it->second : 0) : ns; // new: since it started
+                std::string name;
+                const int watchedCount = g_watchedCount.load(std::memory_order_acquire);
+                for (int w = 0; w < watchedCount; w++)
+                    if (g_watched[w].thread == list[i])
+                        name = g_watched[w].name;
+                if (name.empty() && info.pth_name[0] != 0)
+                    name.assign(info.pth_name, strnlen(info.pth_name, sizeof(info.pth_name)));
+                if (name.empty())
+                    name = list[i] == mainThread ? "main (UIKit, SDL events)" : "unnamed";
+                auto& entry = byName[name];
+                entry.first += delta;
+                entry.second++;
+                allNs += delta;
+            }
+            mach_port_deallocate(mach_task_self(), list[i]);
+        }
+        vm_deallocate(mach_task_self(), vm_address_t(list), vm_size_t(count * sizeof(thread_act_t)));
+        last = std::move(now);
+        if (first)
+            return; // the first look: the times so far, the base for the next
+
+        // The app as a whole: performance-core time, GPU time, wakeups, energy (task_power_info_v2).
+        static uint64_t lastPtime = 0, lastGpuNs = 0, lastWakeups = 0, lastEnergy = 0, lastTaskCpu = 0;
+        std::string task;
+        task_power_info_v2_data_t power{};
+        mach_msg_type_number_t powerCount = TASK_POWER_INFO_V2_COUNT;
+        if (task_info(mach_task_self(), TASK_POWER_INFO_V2, reinterpret_cast<task_info_t>(&power), &powerCount) == KERN_SUCCESS)
+        {
+            const uint64_t taskCpu = power.cpu_energy.total_user + power.cpu_energy.total_system;
+            const uint64_t wakeups = power.cpu_energy.task_interrupt_wakeups + power.cpu_energy.task_platform_idle_wakeups;
+            const uint64_t gpuNs = power.gpu_energy.task_gpu_utilisation;
+            uint64_t energy = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+            energy = power.task_energy;
+#endif
+            if (lastTaskCpu != 0)
+            {
+                const double cpuNs = double(taskCpu - lastTaskCpu);
+                task = fmt::format("; performance cores {:.0f}% of the CPU time, GPU busy {:.0f}%{}, {:.0f} wakeups/s, energy {:.2f} a second "
+                                   "(task_energy: watts if nanojoules)",
+                    cpuNs > 0 ? 100.0 * double(power.task_ptime - lastPtime) / cpuNs : 0.0, 100.0 * double(gpuNs - lastGpuNs) / (seconds * 1e9),
+                    gpuNs == 0 ? " (not reported)" : "", double(wakeups - lastWakeups) / seconds, double(energy - lastEnergy) / 1e9 / seconds);
+            }
+            lastPtime = power.task_ptime;
+            lastGpuNs = gpuNs;
+            lastWakeups = wakeups;
+            lastEnergy = energy;
+            lastTaskCpu = taskCpu;
+        }
+
+        std::vector<std::pair<uint64_t, std::string>> sorted;
+        for (const auto& [name, entry] : byName)
+            sorted.emplace_back(entry.first, entry.second.second > 1 ? fmt::format("{} x{}", name, entry.second.second) : name);
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string text;
+        for (size_t i = 0; i < sorted.size() && i < 16; i++)
+        {
+            const double percent = 100.0 * double(sorted[i].first) / (seconds * 1e9);
+            if (percent < 1.0)
+                break;
+            text += fmt::format("{}{} {:.0f}%", i ? ", " : "", sorted[i].second, percent);
+        }
+        LOGFN("[cpu] threads, last {:.0f} s: the app {:.0f}% of one core ({} threads, {} cores){}; {}", seconds,
+            100.0 * double(allNs) / (seconds * 1e9), count, std::thread::hardware_concurrency(), task, text);
+    }
+
     void SamplerThread()
     {
+        std::unordered_map<uint64_t, uint64_t> threadTimes;
+        ReportThreads(threadTimes, 10.0); // the base
         pthread_setname_np("cpu sampler");
         std::unordered_map<uintptr_t, Symbol> cache;
         Profile profiles[kThreads];
@@ -656,6 +757,7 @@ namespace
             const auto now = std::chrono::steady_clock::now();
             if (now - lastReport >= std::chrono::seconds(10))
             {
+                ReportThreads(threadTimes, std::chrono::duration<double>(now - lastReport).count());
                 lastReport = now;
                 for (int i = 0; i < count; i++)
                 {

@@ -331,3 +331,17 @@ void Shaders::Update()
         g_stats.vertexShaders.load(), g_stats.pixelShaders.load(), g_stats.unknownKey.load(), g_stats.badContainer.load(),
         built, failed, g_stats.binds.load(), g_stats.nullBinds.load(), unknown);
 }
+
+ShaderCacheEntry* Shaders::Prepare(uint64_t hash, bool isPixel)
+{
+    ShaderCacheEntry* entry = FindEntryByHash(hash);
+    if (entry == nullptr || entry->hash != hash)
+        return nullptr;
+    std::lock_guard lock(g_mutex);
+    if (entry->hostShader == nullptr)
+    {
+        entry->hostShader = new HostShader();
+        entry->hostShader->isPixel = isPixel;
+    }
+    return entry->hostShader->isPixel == isPixel ? entry : nullptr;
+}

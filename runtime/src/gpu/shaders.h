@@ -41,6 +41,10 @@ namespace Shaders
     // on first use). Null if the shader could not be created.
     plume::RenderShader* GetHostShader(ShaderCacheEntry* entry, uint32_t specConstants);
 
+    // The cache entry with this hash, with its host shader record made (as when the game creates the shader): pipelines
+    // from earlier runs are made before the game gets to them (gpu/renderer.cpp). Null if the cache has no such shader.
+    ShaderCacheEntry* Prepare(uint64_t hash, bool isPixel);
+
     // Counts a SetVertexShader / SetPixelShader of a guest object (diagnostics).
     void OnBind(uint32_t object);
 

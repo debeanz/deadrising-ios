@@ -14,6 +14,11 @@
 #include <os/hang_watchdog.h>
 #include <os/memory_info.h>
 #include <os/thread_qos.h>
+#include <os/perf.h>
+#include "command_processor.h"
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -89,6 +94,8 @@ namespace
     uint32_t g_stageUs[StageCount];
     std::chrono::steady_clock::time_point g_stageMark;
     uint32_t g_stageEvents, g_stageDeviceEvents, g_stageWindowEvents;
+    // The "[perf]" report's window (LogPerf): stage times summed over its frames, the longest frame, the waits for one.
+    uint64_t g_perfStageUs[StageCount], g_perfWaitFrameUs = 0, g_perfMaxBusyUs = 0, g_perfFrames = 0;
 
     void MarkStage(VideoStage stage)
     {
@@ -347,6 +354,75 @@ namespace
         lastSave = std::chrono::steady_clock::now();
     }
 
+    // ---- "[perf]" every 5 s: where a frame's time goes, part by part (2026-11-25: the iPhone build could only be
+    // measured through its log). The game: how long it waits for the GPU; the GPU (command processor): its waits, and
+    // how many of them ended at a vblank (vsync); the 60 Hz vblank timer; this thread's stages; pipelines; audio;
+    // XMA; the device's thermal state. Every figure is a mean per presented frame unless it says otherwise.
+    // The whole process's CPU time so far (user + system), in seconds.
+    double ProcessCpuSeconds()
+    {
+#ifdef _WIN32
+        FILETIME created, exited, kernel, user;
+        if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+            return 0.0;
+        auto seconds = [](const FILETIME& t) { return double((uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime) / 1e7; };
+        return seconds(kernel) + seconds(user);
+#else
+        rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
+        return double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+#endif
+    }
+
+    void LogPerf()
+    {
+        static double lastCpu = ProcessCpuSeconds();
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::max(0.001, std::chrono::duration<double>(now - last).count());
+        last = now;
+        const double cpu = ProcessCpuSeconds();
+        const double cpuPercent = 100.0 * (cpu - lastCpu) / seconds;
+        lastCpu = cpu;
+        const double frames = double(std::max<uint64_t>(g_perfFrames, 1));
+        const CommandProcessor::Stats cp = CommandProcessor::TakeStats();
+        const Perf::GameWait wait = Perf::TakeGameGpuWait();
+        const Perf::Audio audio = Perf::TakeAudio();
+        const Perf::Xma xma = Perf::TakeXma();
+        const Renderer::PipelineStats pipelines = Renderer::TakePipelineStats();
+        auto ms = [&](uint64_t us) { return double(us) / 1000.0 / frames; };
+        std::string stages;
+        for (uint32_t i = 0; i < StageCount; i++)
+            if (g_perfStageUs[i] / frames >= 100.0)
+                stages += fmt::format("{}{} {:.1f}", stages.empty() ? "" : ", ", kVideoStageNames[i], ms(g_perfStageUs[i]));
+        std::string device;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        static const char* kThermal[] = { "nominal", "fair", "serious (iOS slows the device)", "critical (iOS slows the device)" };
+        const int thermal = IosGpu::ThermalState();
+        device = fmt::format("; device: thermal {}{}", kThermal[std::clamp(thermal, 0, 3)], IosGpu::LowPowerMode() ? ", Low Power Mode on (slower)" : "");
+#endif
+        LOGFN("[perf] {:.1f} s: {:.0f} frames presented ({:.1f} fps), {} game swaps, {} vblanks ({} late over 0.5 ms, latest {:.1f} ms); the process used {:.0f}% of one core",
+            seconds, frames, frames / seconds, cp.swaps, cp.vblanks, cp.vblanksLate, cp.vblankLateMaxNs / 1e6, cpuPercent);
+        LOGFN("[perf]   game frame times: {} up to 20 ms, {} 20-36 ms, {} 36-52 ms, {} over 52 ms (stutters), longest {:.0f} ms",
+            cp.swapIntervals[0], cp.swapIntervals[1], cp.swapIntervals[2], cp.swapIntervals[3], cp.swapIntervalMaxNs / 1e6);
+        LOGFN("[perf]   game waits for the GPU {:.1f} ms a frame ({} waits, longest {:.1f} ms); GPU waits for the CPU {:.1f} ms a frame "
+              "({} waits, {} ended at a vblank, longest {:.1f} ms)",
+            wait.ns / 1e6 / frames, wait.calls, wait.maxNs / 1e6, cp.waitNs / 1e6 / frames, cp.waits, cp.waitsAfterVblank, cp.waitMaxNs / 1e6);
+        LOGFN("[perf]   video thread a frame: waiting for the game {:.1f} ms, {} (longest frame {:.1f} ms)",
+            ms(g_perfWaitFrameUs), stages.empty() ? std::string("nothing over 0.1 ms") : stages, g_perfMaxBusyUs / 1000.0);
+        LOGFN("[perf]   pipelines: {} made ({:.0f} ms each, longest {:.0f} ms), {} still queued, {} draws skipped waiting for one{}",
+            pipelines.made, pipelines.made ? pipelines.ns / 1e6 / double(pipelines.made) : 0.0, pipelines.maxNs / 1e6, pipelines.queued,
+            pipelines.skippedDraws, device);
+        LOGFN("[perf]   audio: mixer ran {} times ({:.0f}/s, 187.5 expected), {} late over 2 ms (latest {:.1f} ms), queue {:.0f} ms on average "
+              "(lowest {:.0f} ms, nearly empty {} times), {} dropped; XMA {} packets, {:.2f} ms each (longest {:.1f} ms)",
+            audio.runs, audio.runs / seconds, audio.late, audio.lateMaxNs / 1e6, audio.runs ? audio.queuedMsSum / double(audio.runs) : 0.0,
+            audio.runs ? audio.queuedMsMin : 0.0, audio.nearlyEmpty, audio.dropped, xma.decodes, xma.decodes ? xma.ns / 1e6 / double(xma.decodes) : 0.0,
+            xma.maxNs / 1e6);
+        for (uint64_t& us : g_perfStageUs)
+            us = 0;
+        g_perfWaitFrameUs = g_perfMaxBusyUs = g_perfFrames = 0;
+    }
+
     void UpdateTitle(const Video::FrameStats& stats, double fps, uint32_t frames)
     {
         // Vulkan: render passes a frame and what their attachments hold. A tile-based GPU (iPhone, iPad) loads all of
@@ -369,6 +445,8 @@ namespace
 #endif
 
         static uint32_t updates;
+        if (updates % 10 == 0)
+            LogPerf();
         if (updates++ % 10 == 0) // every ~5 s
             LOGFN("[video] {}; [memory] {}{}", title, MemoryInfo::Describe(), passesPerFrame == 0.0 ? std::string() :
                 fmt::format("; render passes {:.0f} a frame (a tile-based GPU loads {:.0f} MB and stores {:.0f} MB)", passesPerFrame, loadedPerFrame, storedPerFrame));
@@ -474,7 +552,10 @@ namespace
             {
                 LOGN("[video] window closed - exiting");
                 if (!kRenderThread)
+                {
                     SaveVulkanPipelines(true); // iOS: the render thread saves it when the app leaves the screen
+                    Renderer::SavePipelineList(true);
+                }
                 std::_Exit(0);
             }
         }
@@ -507,6 +588,7 @@ namespace
                 paused = true;
                 WaitAll();
                 SaveVulkanPipelines(true); // the app may not come back
+                Renderer::SavePipelineList(true);
                 LOGN("[video] the app left the screen: rendering paused");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -527,7 +609,9 @@ namespace
         bool gameFrame = false;
         {
             std::unique_lock lock(g_frameMutex);
+            const auto waitStart = std::chrono::steady_clock::now();
             g_frameReady.wait_for(lock, std::chrono::milliseconds(50), [] { return g_framePending; });
+            g_perfWaitFrameUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count());
             g_stageMark = std::chrono::steady_clock::now(); // waiting for the game is not this thread's time
             if (g_framePending)
             {
@@ -583,6 +667,7 @@ namespace
             OptionsMenu::SetFps(fps);
             Shaders::Update();
             SaveVulkanPipelines(false);
+            Renderer::SavePipelineList(false);
             lastTitle = now;
             framesSinceTitle = 0;
         }
@@ -604,6 +689,10 @@ namespace
                     videoFrame, totalUs / 1000, stages, g_stageEvents, g_stageDeviceEvents, g_stageWindowEvents);
             }
         }
+        for (uint32_t i = 0; i < StageCount; i++)
+            g_perfStageUs[i] += g_stageUs[i];
+        g_perfMaxBusyUs = std::max<uint64_t>(g_perfMaxBusyUs, totalUs);
+        g_perfFrames++;
         for (uint32_t& us : g_stageUs)
             us = 0;
         g_stageEvents = g_stageDeviceEvents = g_stageWindowEvents = 0;

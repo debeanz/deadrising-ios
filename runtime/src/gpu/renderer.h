@@ -44,6 +44,15 @@ namespace Renderer
         uint32_t destLevel, uint32_t destSlice, uint32_t clearColor, float clearZ, uint32_t clearStencil);
     void OnPresent(uint32_t device);
     void AddGpuWait(uint32_t microseconds); // video thread: time waiting for the GPU to finish a frame
+    // The pipelines made so far, for the next run to make in the background from the start (_recomp_cache/
+    // pipelines_<api>.bin): when new ones were added, at most every 30 s unless 'now'. Video thread.
+    void SavePipelineList(bool now);
+    // The "[perf]" report: pipelines made since the last call (and how long they took), still queued, draws skipped.
+    struct PipelineStats
+    {
+        uint64_t made = 0, ns = 0, maxNs = 0, queued = 0, skippedDraws = 0;
+    };
+    PipelineStats TakePipelineStats();
     uint32_t PipelineCount();               // pipelines made (or being made) so far
 
     // Debugging (DR_TEX_WATCH=1): the runtime's own writes into guest memory (XMA output, resolve

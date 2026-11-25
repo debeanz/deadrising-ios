@@ -4,6 +4,8 @@
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <os/perf.h>
+#include <os/thread_qos.h>
 #include <gpu/renderer.h>
 #include <gpu/command_processor.h>
 
@@ -210,7 +212,24 @@ namespace
     }
 
     // Decodes one 2 KB packet; appends big-endian 16-bit interleaved samples to host.pending.
+    std::atomic<uint64_t> g_perfDecodes{ 0 }, g_perfDecodeNs{ 0 }, g_perfDecodeMaxNs{ 0 };
+
+    void DecodePacketTimed(HostContext& host, const uint8_t* data);
+
     void DecodePacket(HostContext& host, const uint8_t* data)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        DecodePacketTimed(host, data);
+        const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        g_perfDecodes.fetch_add(1, std::memory_order_relaxed);
+        g_perfDecodeNs.fetch_add(ns, std::memory_order_relaxed);
+        uint64_t current = g_perfDecodeMaxNs.load(std::memory_order_relaxed);
+        while (ns > current && !g_perfDecodeMaxNs.compare_exchange_weak(current, ns, std::memory_order_relaxed))
+        {
+        }
+    }
+
+    void DecodePacketTimed(HostContext& host, const uint8_t* data)
     {
         host.packet->data = const_cast<uint8_t*>(data);
         host.packet->size = int(kBytesPerPacket);
@@ -429,6 +448,8 @@ namespace
 
     void Worker()
     {
+        SetThreadInteractive(); // os/thread_qos.h: audio decoded late is audio heard late
+        NameThisThread("xma decoder");
         auto lastLog = std::chrono::steady_clock::now();
         while (g_running)
         {
@@ -604,4 +625,13 @@ void DrMmioWrite32(uint32_t address, uint32_t value)
         Xma::WriteRegister((address & 0xFFFFu) >> 2, __builtin_bswap32(value));
     else if ((address & 0xFFFF0000u) == 0x7FC80000u)
         CommandProcessor::OnRegisterWrite(address);
+}
+
+Perf::Xma Perf::TakeXma()
+{
+    Xma x;
+    x.decodes = g_perfDecodes.exchange(0);
+    x.ns = g_perfDecodeNs.exchange(0);
+    x.maxNs = g_perfDecodeMaxNs.exchange(0);
+    return x;
 }

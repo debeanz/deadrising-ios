@@ -5,6 +5,8 @@
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <os/perf.h>
+#include <os/thread_qos.h>
 
 #include <SDL.h>
 
@@ -59,9 +61,15 @@ namespace
         return true;
     }
 
+    // For the "[perf]" report (Perf::TakeAudio).
+    std::mutex g_perfMutex;
+    Perf::Audio g_perf;
+
     // Runs the game's mixer every 5.33 ms, keeping at most ~50 ms queued.
     void AudioThread()
     {
+        SetThreadInteractive(); // os/thread_qos.h: a late mixer run is a gap in the sound
+        NameThisThread("audio mixer");
         GuestThreadContext context(0);
         const uint32_t frameBytes = (g_stereo ? 2 : kChannels) * kSamples * sizeof(float);
         const auto interval = std::chrono::nanoseconds(1000000000ull * kSamples / kSampleRate);
@@ -74,8 +82,24 @@ namespace
             // run in real time even when the device does not play (iPhone, 2026-11-25: the audio
             // session not running yet, the queue stayed full and the game hung in its audio set-up
             // after the first frame). A queue full for over 200 ms is dropped and mixing goes on.
-            const bool room = SDL_GetQueuedAudioSize(g_device) / frameBytes <= 10;
+            const uint32_t queuedBytes = SDL_GetQueuedAudioSize(g_device);
+            const bool room = queuedBytes / frameBytes <= 10;
             const auto start = std::chrono::steady_clock::now();
+            {
+                const double queuedMs = 1000.0 * double(queuedBytes / frameBytes) * kSamples / kSampleRate;
+                const int64_t lateNs = std::chrono::duration_cast<std::chrono::nanoseconds>(start - next).count();
+                std::lock_guard lock(g_perfMutex);
+                g_perf.runs++;
+                g_perf.queuedMsSum += queuedMs;
+                g_perf.queuedMsMin = std::min(g_perf.queuedMsMin, queuedMs);
+                if (queuedBytes < 2 * frameBytes)
+                    g_perf.nearlyEmpty++; // under 10.7 ms left: a late run next is a gap
+                if (lateNs > 2000000)
+                {
+                    g_perf.late++;
+                    g_perf.lateMaxNs = std::max(g_perf.lateMaxNs, uint64_t(lateNs));
+                }
+            }
             if (!room && !full)
             {
                 full = true;
@@ -88,6 +112,10 @@ namespace
                 if (!room)
                 {
                     SDL_ClearQueuedAudio(g_device);
+                    {
+                        std::lock_guard lock(g_perfMutex);
+                        g_perf.dropped++;
+                    }
                     if (!reported)
                     {
                         reported = true;
@@ -192,4 +220,12 @@ namespace Audio
             SDL_QueueAudio(g_device, out, sizeof(out));
         }
     }
+}
+
+Perf::Audio Perf::TakeAudio()
+{
+    std::lock_guard lock(g_perfMutex);
+    Audio a = g_perf;
+    g_perf = Audio{};
+    return a;
 }

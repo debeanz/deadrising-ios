@@ -50,6 +50,55 @@ namespace
     std::condition_variable g_kick;
     bool g_kickPending = false;
 
+    // For the "[perf]" report (CommandProcessor::TakeStats).
+    std::atomic<uint64_t> g_waitCount{ 0 }, g_waitNs{ 0 }, g_waitMaxNs{ 0 }, g_waitAfterVblank{ 0 };
+    std::atomic<uint64_t> g_vblanks{ 0 }, g_vblankLate{ 0 }, g_vblankLateMaxNs{ 0 }, g_swaps{ 0 };
+    std::atomic<int64_t> g_lastVblankNs{ 0 };
+    std::atomic<uint64_t> g_swapIntervals[4], g_swapIntervalMaxNs{ 0 };
+    std::atomic<int64_t> g_lastSwapNs{ 0 };
+
+    int64_t NowNs()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void AtomicMax(std::atomic<uint64_t>& target, uint64_t value)
+    {
+        uint64_t current = target.load(std::memory_order_relaxed);
+        while (value > current && !target.compare_exchange_weak(current, value, std::memory_order_relaxed))
+        {
+        }
+    }
+
+    // The command processor moved on (WaitForProgress): a batch done (and the read pointer written back), a fence
+    // or memory write, a WAIT_REG_MEM reached, a vblank. D3D's spin-waits sleep until one of these.
+    std::atomic<uint64_t> g_progress{ 0 };
+    std::atomic<int> g_progressWaiters{ 0 };
+    std::mutex g_progressMutex;
+    std::condition_variable g_progressCv;
+
+    void Progress()
+    {
+        g_progress.fetch_add(1); // seq_cst with the waiter count (WaitForProgress): one of the two sees the other
+        if (g_progressWaiters.load() != 0)
+        {
+            {
+                std::lock_guard lock(g_progressMutex);
+            }
+            g_progressCv.notify_all();
+        }
+    }
+
+    // Wakes the command processor (a new write pointer, or the vblank handler cleared a flag it waits on).
+    void Kick()
+    {
+        {
+            std::lock_guard lock(g_kickMutex);
+            g_kickPending = true;
+        }
+        g_kick.notify_one();
+    }
+
     uint32_t LoadBE(uint32_t guest)
     {
         return ByteSwap(*(uint32_t*)g_memory.Translate(guest));
@@ -312,6 +361,7 @@ namespace
                 uint32_t address = data[0] & 0x3FFFFFFF;
                 for (uint32_t i = 1; i < count; i++, address += 4)
                     GpuStore(address, data[i]);
+                Progress();
                 break;
             }
 
@@ -337,9 +387,20 @@ namespace
                 if (isMemory)
                 {
                     // Wait for the CPU to write a value (bounded, so a mistake cannot hang the GPU thread):
-                    // spinning first, as a sleep lasts about a millisecond on Windows.
-                    for (int spin = 0; spin < 4000 && !CompareFunction(info, GpuLoad(data[1]) & data[3], data[2]); spin++)
+                    // spinning first for up to 50 us by the clock (4000 pause instructions were 0.2-0.5 ms on
+                    // a PC but a few microseconds on an iPhone, whose "yield" costs about a cycle), then
+                    // waiting for a kick: the vblank handler that clears the swap flag the command stream
+                    // waits on kicks it (VblankThread), so the GPU goes on at once instead of at its next poll.
+                    const int64_t waitStart = NowNs();
+                    const bool satisfied = CompareFunction(info, GpuLoad(data[1]) & data[3], data[2]);
+                    if (!satisfied)
+                        Progress(); // what came before it is done (fences): the game may be waiting for that
+                    for (int spin = 0; !satisfied && spin < 100000 && !CompareFunction(info, GpuLoad(data[1]) & data[3], data[2]); spin++)
+                    {
                         DR_SPIN_PAUSE();
+                        if ((spin & 63) == 63 && NowNs() - waitStart > 50000)
+                            break;
+                    }
                     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
                     while (!CompareFunction(info, GpuLoad(data[1]) & data[3], data[2]))
                     {
@@ -356,7 +417,20 @@ namespace
                             }
                             break;
                         }
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        std::unique_lock lock(g_kickMutex);
+                        g_kick.wait_for(lock, std::chrono::microseconds(100), [] { return g_kickPending; });
+                        g_kickPending = false;
+                    }
+                    if (!satisfied)
+                    {
+                        const int64_t end = NowNs();
+                        const uint64_t waited = uint64_t(end - waitStart);
+                        g_waitCount.fetch_add(1, std::memory_order_relaxed);
+                        g_waitNs.fetch_add(waited, std::memory_order_relaxed);
+                        AtomicMax(g_waitMaxNs, waited);
+                        // Released within 1 ms of a vblank: a wait for the display (vsync), not for the CPU.
+                        if (end - g_lastVblankNs.load(std::memory_order_relaxed) < 1000000)
+                            g_waitAfterVblank.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
                 break; // register waits (vblank, idle states) are treated as satisfied
@@ -380,6 +454,7 @@ namespace
             {
                 uint32_t value = (data[0] >> 31) ? g_swapCounter.load() : data[2];
                 GpuStore(data[1], value);
+                Progress();
                 break;
             }
 
@@ -407,6 +482,7 @@ namespace
     void CommandProcessorThread()
     {
         SetThreadInteractive(); // os/thread_qos.h
+        NameThisThread("command processor");
         CpuSampler::RegisterCurrentThread("command processor"); // DR_CPU_PROFILE=1
         CpuSampler::WatchHitchThread("command processor"); // "[hitch profile]"
         uint32_t rptr = 0;
@@ -433,6 +509,7 @@ namespace
 
                 if (uint32_t writeBack = g_rptrWriteBack)
                     *(be<uint32_t>*)g_memory.Translate(CommandProcessor::GpuToGuest(writeBack)) = rptr;
+                Progress();
             }
             else
             {
@@ -456,6 +533,9 @@ namespace
 
     void VblankThread()
     {
+        SetThreadInteractive(); // os/thread_qos.h: a late vblank makes a frame miss it (2 vblanks: 30 fps)
+        NameThisThread("vblank");
+        CpuSampler::WatchHitchThread("vblank");
         auto next = std::chrono::steady_clock::now();
         // Debugging: DR_VBLANK_HZ=<rate> (60 by default).
         static const int64_t period = getenv("DR_VBLANK_HZ") ? 1000000 / std::max(1, atoi(getenv("DR_VBLANK_HZ"))) : 16667;
@@ -463,7 +543,19 @@ namespace
         {
             next += std::chrono::microseconds(period);
             std::this_thread::sleep_until(next);
+            const int64_t late = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - next).count();
+            if (late > 500000)
+            {
+                g_vblankLate.fetch_add(1, std::memory_order_relaxed);
+                AtomicMax(g_vblankLateMaxNs, uint64_t(late));
+            }
+            if (late > 100000000)
+                next = std::chrono::steady_clock::now(); // stalled (debugger, background): no burst of vblanks
             DispatchInterrupt(0, 2);
+            g_vblanks.fetch_add(1, std::memory_order_relaxed);
+            g_lastVblankNs.store(NowNs(), std::memory_order_relaxed);
+            Kick(); // the handler cleared the swap flag: the command stream goes on now
+            Progress();
         }
     }
 
@@ -525,6 +617,15 @@ void CommandProcessor::SetInterruptCallback(uint32_t callback, uint32_t userData
 void CommandProcessor::OnSwap()
 {
     g_swapCounter++;
+    g_swaps.fetch_add(1, std::memory_order_relaxed);
+    const int64_t now = NowNs();
+    const int64_t last = g_lastSwapNs.exchange(now, std::memory_order_relaxed);
+    if (last != 0 && now - last < 5000000000ll) // not across a pause or a load of seconds
+    {
+        const uint64_t interval = uint64_t(now - last);
+        g_swapIntervals[interval < 20000000 ? 0 : interval < 36000000 ? 1 : interval < 52000000 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+        AtomicMax(g_swapIntervalMaxNs, interval);
+    }
 }
 
 void CommandProcessor::OnRegisterWrite(uint32_t address)
@@ -536,4 +637,37 @@ void CommandProcessor::OnRegisterWrite(uint32_t address)
         g_kickPending = true;
     }
     g_kick.notify_one();
+}
+
+void CommandProcessor::WaitForProgress(uint64_t& seen, std::chrono::microseconds timeout)
+{
+    uint64_t now = g_progress.load();
+    if (now == seen)
+    {
+        g_progressWaiters.fetch_add(1);
+        {
+            std::unique_lock lock(g_progressMutex);
+            g_progressCv.wait_for(lock, timeout, [&] { return g_progress.load() != seen; });
+        }
+        g_progressWaiters.fetch_sub(1);
+        now = g_progress.load();
+    }
+    seen = now;
+}
+
+CommandProcessor::Stats CommandProcessor::TakeStats()
+{
+    Stats s;
+    s.waits = g_waitCount.exchange(0);
+    for (int i = 0; i < 4; i++)
+        s.swapIntervals[i] = g_swapIntervals[i].exchange(0);
+    s.swapIntervalMaxNs = g_swapIntervalMaxNs.exchange(0);
+    s.waitNs = g_waitNs.exchange(0);
+    s.waitMaxNs = g_waitMaxNs.exchange(0);
+    s.waitsAfterVblank = g_waitAfterVblank.exchange(0);
+    s.vblanks = g_vblanks.exchange(0);
+    s.vblanksLate = g_vblankLate.exchange(0);
+    s.vblankLateMaxNs = g_vblankLateMaxNs.exchange(0);
+    s.swaps = g_swaps.exchange(0);
+    return s;
 }

@@ -17,6 +17,7 @@
 #include <hid/input.h>
 #include <hid/touch_controls.h>
 #include <os/logger.h>
+#include <os/thread_qos.h>
 #include <os/hang_watchdog.h>
 #include <os/memory_info.h>
 #include <profiler/cpu_sampler.h>
@@ -246,7 +247,28 @@ namespace
         uint32_t auxMask = 0;     // auxiliary host slots (kAuxSlotBase + stream)
         uint32_t auxStride[kAuxSlotBase] = {};
         int positionElement = -1;
+        uint64_t contentHash = 0; // DeclarationContentHash: the same layout has the same hash in every run
     };
+
+    // What a pipeline needs of a declaration (its host input layout and slots), hashed: pipelines are found by it
+    // (PipelineHash) so that the list kept from earlier runs matches (PipelineRecipe).
+    uint64_t DeclarationContentHash(const VertexDeclaration& decl)
+    {
+        XXH3_state_t* state = XXH3_createState();
+        XXH3_64bits_reset(state);
+        for (const RenderInputElement& e : decl.inputElements)
+        {
+            if (e.semanticName != nullptr)
+                XXH3_64bits_update(state, e.semanticName, strlen(e.semanticName) + 1);
+            const uint32_t fields[5] = { e.semanticIndex, e.location, uint32_t(e.format), e.slotIndex, e.alignedByteOffset };
+            XXH3_64bits_update(state, fields, sizeof(fields));
+        }
+        const uint32_t masks[2] = { decl.streamMask, decl.auxMask };
+        XXH3_64bits_update(state, masks, sizeof(masks));
+        const uint64_t hash = XXH3_64bits_digest(state);
+        XXH3_freeState(state);
+        return hash;
+    }
 
     std::mutex g_declarationMutex;
     ankerl::unordered_dense::map<uint32_t, std::unique_ptr<VertexDeclaration>> g_declarations;
@@ -1032,7 +1054,17 @@ namespace
         void Start()
         {
             std::call_once(started, [this] {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                // iPhone / iPad: pipelines wait on the Metal compiler (another process) most of their time.
+                const uint32_t threads = std::clamp(std::thread::hardware_concurrency() - 1, 3u, 8u);
+#else
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+                // iPhone / iPad: a pipeline waits on the Metal compiler (another process) most of its time.
+                const uint32_t threads = std::clamp(std::thread::hardware_concurrency() - 1, 3u, 8u);
+#else
                 const uint32_t threads = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+#endif
+#endif
                 for (uint32_t i = 0; i < threads; i++)
                     std::thread([this] { Run(); }).detach();
                 LOGFN("[renderer] {} texture decode threads", threads);
@@ -2502,6 +2534,7 @@ void Renderer::OnCreateVertexDeclaration(uint32_t elements, uint32_t declaration
             decl->inputElements.emplace_back(kUsageNames[kLocations[i].usage], kLocations[i].usageIndex, kLocations[i].location,
                 IsUintUsage(kLocations[i].usage) ? RenderFormat::R32G32B32A32_UINT : RenderFormat::R32G32B32A32_FLOAT, kDummySlot, 0);
 
+    decl->contentHash = DeclarationContentHash(*decl);
     std::lock_guard lock(g_declarationMutex);
     auto& slot = g_declarations[declaration];
     if (slot != nullptr)
@@ -3520,6 +3553,7 @@ namespace
             uint32_t stencil = 0;
         };
         std::vector<PendingClear> pendingClears;
+        bool freshColor = false; // new colour storage nothing was drawn into yet (ClearFreshTarget)
     };
     ankerl::unordered_dense::map<uint64_t, std::unique_ptr<HostTarget>> g_targets;
     HostTarget* g_shownTarget = nullptr;
@@ -3720,7 +3754,114 @@ namespace
     }
     std::chrono::steady_clock::time_point g_pipelineDeadline = std::chrono::steady_clock::time_point::max(); // Replay sets it
     uint32_t g_pipelineSkippedDraws = 0; // draws skipped because their pipeline was being made (video thread)
+    std::atomic<uint64_t> g_perfSkippedDraws{ 0 };
     std::atomic<uint32_t> g_pipelinesFailed{ 0 };
+
+    std::unique_ptr<RenderPipeline> CreatePipeline(const PipelineKey& key);
+    std::atomic<uint64_t> g_perfPipelinesMade{ 0 }, g_perfPipelineNs{ 0 }, g_perfPipelineMaxNs{ 0 };
+    std::atomic<int64_t> g_perfPipelinesQueued{ 0 };
+
+    std::unique_ptr<RenderPipeline> CreatePipelineTimed(const PipelineKey& key)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        std::unique_ptr<RenderPipeline> pipeline = CreatePipeline(key);
+        const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        g_perfPipelinesMade.fetch_add(1, std::memory_order_relaxed);
+        g_perfPipelineNs.fetch_add(ns, std::memory_order_relaxed);
+        uint64_t current = g_perfPipelineMaxNs.load(std::memory_order_relaxed);
+        while (ns > current && !g_perfPipelineMaxNs.compare_exchange_weak(current, ns, std::memory_order_relaxed))
+        {
+        }
+        return pipeline;
+    }
+
+    // A pipeline key hashed by what it is: its shaders by their cache hashes and its declaration by its content (a
+    // key holds pointers, which differ between runs).
+    uint64_t PipelineHash(const PipelineKey& key)
+    {
+        PipelineKey canonical = key;
+        canonical.vertexShader = reinterpret_cast<const ShaderCacheEntry*>(uintptr_t(key.vertexShader != nullptr ? key.vertexShader->hash : 0));
+        canonical.pixelShader = reinterpret_cast<const ShaderCacheEntry*>(uintptr_t(key.pixelShader != nullptr ? key.pixelShader->hash : 0));
+        canonical.declaration = reinterpret_cast<const VertexDeclaration*>(uintptr_t(key.declaration != nullptr ? key.declaration->contentHash : 0));
+        return XXH3_64bits(&canonical, sizeof(canonical));
+    }
+
+    // ---- Pipelines kept from earlier runs (2026-11-25, iPhone). MoltenVK compiles Metal shaders the first time a
+    // pipeline is made (about 50-100 ms each, 255 in the first minutes of the game), and the draws that wait for one
+    // are skipped meanwhile (AsyncPipelines): objects and the ground were missing for seconds. Every pipeline made is
+    // recorded (shader hashes, the vertex layout, the state) in _recomp_cache/pipelines_<api>.bin; the next run makes
+    // them all in the background from the start (the logos), so the game finds them ready. DR_PIPELINE_LIST=0 off.
+    struct RecipeElement
+    {
+        char semantic[16];
+        uint32_t semanticIndex, location, format, slot, offset;
+    };
+    struct PipelineRecipe
+    {
+        uint64_t vertexShader, pixelShader;
+        uint32_t streamMask, auxMask, elementCount, pad;
+        uint16_t strides[kMaxStreams + 1];
+        uint32_t topology, colorFormat, depthControl, blendControl, colorMask, cull, specConstants, stencilRefMask, samples, flags;
+        RecipeElement elements[48];
+    };
+    constexpr uint32_t kRecipeMagic = 0x4C505244; // "DRPL"
+    constexpr uint32_t kRecipeVersion = 1;
+
+    std::mutex g_recipeMutex;
+    std::vector<PipelineRecipe> g_recipes;
+    ankerl::unordered_dense::set<uint64_t> g_recipeHashes;
+    bool g_recipesDirty = false;
+    std::deque<std::unique_ptr<VertexDeclaration>> g_recipeDeclarations; // the declarations of the pipelines made from the list
+
+    bool PipelineListEnabled()
+    {
+        static const bool enabled = getenv("DR_PIPELINE_LIST") == nullptr || atoi(getenv("DR_PIPELINE_LIST")) != 0;
+        return enabled;
+    }
+
+    // A pipeline was made: into the list (once).
+    void RecordPipeline(const PipelineKey& key, uint64_t hash)
+    {
+        if (!PipelineListEnabled() || key.vertexShader == nullptr || key.declaration == nullptr || key.declaration->inputElements.size() > 48)
+            return;
+        std::lock_guard lock(g_recipeMutex);
+        if (!g_recipeHashes.insert(hash).second)
+            return;
+        PipelineRecipe r{};
+        r.vertexShader = key.vertexShader->hash;
+        r.pixelShader = key.pixelShader != nullptr ? key.pixelShader->hash : 0;
+        r.streamMask = key.declaration->streamMask;
+        r.auxMask = key.declaration->auxMask;
+        r.elementCount = uint32_t(key.declaration->inputElements.size());
+        for (uint32_t i = 0; i < r.elementCount; i++)
+        {
+            const RenderInputElement& e = key.declaration->inputElements[i];
+            strncpy(r.elements[i].semantic, e.semanticName != nullptr ? e.semanticName : "", sizeof(r.elements[i].semantic) - 1);
+            r.elements[i].semanticIndex = e.semanticIndex;
+            r.elements[i].location = e.location;
+            r.elements[i].format = uint32_t(e.format);
+            r.elements[i].slot = e.slotIndex;
+            r.elements[i].offset = e.alignedByteOffset;
+        }
+        memcpy(r.strides, key.strides, sizeof(r.strides));
+        r.topology = uint32_t(key.topology);
+        r.colorFormat = uint32_t(key.colorFormat);
+        r.depthControl = key.depthControl;
+        r.blendControl = key.blendControl;
+        r.colorMask = key.colorMask;
+        r.cull = key.cull;
+        r.specConstants = key.specConstants;
+        r.stencilRefMask = key.stencilRefMask;
+        r.samples = key.samples;
+        r.flags = key.flags;
+        g_recipes.push_back(r);
+        g_recipesDirty = true;
+    }
+
+    std::filesystem::path PipelineListPath()
+    {
+        return Config::Path().parent_path() / "_recomp_cache" / (g_vulkan ? "pipelines_vulkan.bin" : "pipelines_d3d12.bin");
+    }
 
     class WorkerPool
     {
@@ -3745,6 +3886,7 @@ namespace
     private:
         void Run()
         {
+            NameThisThread(name); // "[cpu] threads"
             while (true)
             {
                 std::function<void()> job;
@@ -4007,7 +4149,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
     // worker is making it.
     RenderPipeline* GetPipeline(const PipelineKey& key)
     {
-        const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+        const uint64_t hash = PipelineHash(key);
         PipelineSlot* slot;
         {
             std::unique_lock lock(g_pipelineMutex);
@@ -4023,6 +4165,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                         if (!g_pipelineReady.wait_until(lock, g_pipelineDeadline, [slot] { return slot->ready; }))
                         {
                             g_pipelineSkippedDraws++;
+                            g_perfSkippedDraws.fetch_add(1, std::memory_order_relaxed);
                             return nullptr; // drawn once the pipeline is ready
                         }
                     }
@@ -4035,7 +4178,9 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             slot = entry.get();
         }
         HitchStats::Timer timer(HitchStats::Pipelines);
-        std::unique_ptr<RenderPipeline> pipeline = CreatePipeline(key);
+        std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
+        if (pipeline != nullptr)
+            RecordPipeline(key, hash);
         {
             std::lock_guard lock(g_pipelineMutex);
             slot->pipeline = std::move(pipeline);
@@ -4054,7 +4199,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         {
             if (cmd.type != Command::Draw || (cmd.colorKey == 0 && cmd.depthKey == 0) || cmd.key.vertexShader == nullptr)
                 continue;
-            const uint64_t hash = XXH3_64bits(&cmd.key, sizeof(cmd.key));
+            const uint64_t hash = PipelineHash(cmd.key);
             if (!known.insert(hash).second)
                 continue;
             PipelineSlot* slot;
@@ -4067,8 +4212,12 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 slot = entry.get();
             }
             const PipelineKey key = cmd.key;
-            g_pipelinePool.Submit([key, slot] {
-                std::unique_ptr<RenderPipeline> pipeline = CreatePipeline(key);
+            g_perfPipelinesQueued.fetch_add(1, std::memory_order_relaxed);
+            g_pipelinePool.Submit([key, slot, hash] {
+                std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
+                g_perfPipelinesQueued.fetch_sub(1, std::memory_order_relaxed);
+                if (pipeline != nullptr)
+                    RecordPipeline(key, hash);
                 {
                     std::lock_guard lock(g_pipelineMutex);
                     slot->pipeline = std::move(pipeline);
@@ -4077,6 +4226,105 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 g_pipelineReady.notify_all();
             });
         }
+    }
+
+
+    // The list from earlier runs (PipelineRecipe): every pipeline in it made in the background, from the start.
+    void LoadPipelineList()
+    {
+        if (!PipelineListEnabled())
+            return;
+        std::ifstream file(PipelineListPath(), std::ios::binary);
+        if (!file)
+            return;
+        uint32_t header[4] = {};
+        file.read(reinterpret_cast<char*>(header), sizeof(header));
+        if (!file || header[0] != kRecipeMagic || header[1] != kRecipeVersion || header[2] != sizeof(PipelineRecipe) || header[3] > 100000)
+        {
+            LOGN("[renderer] pipeline list from an earlier version: ignored");
+            return;
+        }
+        std::vector<PipelineRecipe> recipes(header[3]);
+        file.read(reinterpret_cast<char*>(recipes.data()), std::streamsize(recipes.size() * sizeof(PipelineRecipe)));
+        if (!file)
+            return;
+
+        static std::deque<std::string> s_semantics; // names not in kUsageNames (none expected)
+        uint32_t queued = 0, missing = 0;
+        for (const PipelineRecipe& r : recipes)
+        {
+            ShaderCacheEntry* vs = Shaders::Prepare(r.vertexShader, false);
+            ShaderCacheEntry* ps = r.pixelShader != 0 ? Shaders::Prepare(r.pixelShader, true) : nullptr;
+            if (vs == nullptr || (r.pixelShader != 0 && ps == nullptr) || r.elementCount > 48)
+            {
+                missing++;
+                continue;
+            }
+            auto decl = std::make_unique<VertexDeclaration>();
+            decl->streamMask = r.streamMask;
+            decl->auxMask = r.auxMask;
+            for (uint32_t i = 0; i < r.elementCount; i++)
+            {
+                const RecipeElement& e = r.elements[i];
+                char name[sizeof(e.semantic) + 1] = {};
+                memcpy(name, e.semantic, sizeof(e.semantic));
+                const char* semantic = nullptr;
+                for (const char* known : kUsageNames)
+                    if (strcmp(known, name) == 0)
+                        semantic = known;
+                if (semantic == nullptr)
+                    semantic = s_semantics.emplace_back(name).c_str();
+                decl->inputElements.emplace_back(semantic, e.semanticIndex, e.location, RenderFormat(e.format), e.slot, e.offset);
+            }
+            decl->contentHash = DeclarationContentHash(*decl);
+
+            PipelineKey key{};
+            key.vertexShader = vs;
+            key.pixelShader = ps;
+            key.declaration = decl.get();
+            memcpy(key.strides, r.strides, sizeof(key.strides));
+            key.topology = RenderPrimitiveTopology(r.topology);
+            key.colorFormat = RenderFormat(r.colorFormat);
+            key.depthControl = r.depthControl;
+            key.blendControl = r.blendControl;
+            key.colorMask = r.colorMask;
+            key.cull = r.cull;
+            key.specConstants = r.specConstants;
+            key.stencilRefMask = r.stencilRefMask;
+            key.samples = r.samples;
+            key.flags = r.flags;
+            const uint64_t hash = PipelineHash(key);
+            {
+                std::lock_guard lock(g_recipeMutex);
+                if (!g_recipeHashes.insert(hash).second)
+                    continue;
+                g_recipes.push_back(r);
+            }
+            PipelineSlot* slot;
+            {
+                std::lock_guard lock(g_pipelineMutex);
+                auto& entry = g_pipelines[hash];
+                if (entry != nullptr)
+                    continue;
+                entry = std::make_unique<PipelineSlot>();
+                slot = entry.get();
+            }
+            g_recipeDeclarations.push_back(std::move(decl));
+            g_perfPipelinesQueued.fetch_add(1, std::memory_order_relaxed);
+            g_pipelinePool.Submit([key, slot] {
+                std::unique_ptr<RenderPipeline> pipeline = CreatePipelineTimed(key);
+                g_perfPipelinesQueued.fetch_sub(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard lock(g_pipelineMutex);
+                    slot->pipeline = std::move(pipeline);
+                    slot->ready = true;
+                }
+                g_pipelineReady.notify_all();
+            });
+            queued++;
+        }
+        LOGFN("[renderer] {} pipelines from earlier runs made in the background{}", queued,
+            missing != 0 ? fmt::format(" ({} with shaders no longer in the cache left out)", missing) : std::string());
     }
 
     std::unique_ptr<RenderPipeline> CreatePipeline(const PipelineKey& key)
@@ -4283,6 +4531,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             target.format = format;
             target.color = g_device->createTexture(RenderTextureDesc::ColorTarget(target.width, target.height, format, RenderMultisampling(samples)));
             target.colorLayout = RenderTextureLayout::UNKNOWN;
+            target.freshColor = true;
             if (samples > 1)
             {
                 target.single = g_device->createTexture(RenderTextureDesc::ColorTarget(target.width, target.height, format));
@@ -4492,6 +4741,30 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
     }
 
     // Before 'target' is drawn: the clears waiting on targets that share its depth buffer (and its own).
+    // A colour target's new storage starts black, as a clear of the whole target ahead of the game's own (its first
+    // render pass's CLEAR load operation: free on a tile-based GPU). Vulkan and Metal leave new storage undefined: a
+    // frame that showed or resolved it before the game drew everything showed whatever the memory held (2026-11-25,
+    // iPhone: a pink flash as the game started). DR_FRESH_TARGET_CLEAR=0 off.
+    void ClearFreshTarget(HostTarget& target)
+    {
+        static const bool enabled = getenv("DR_FRESH_TARGET_CLEAR") == nullptr || atoi(getenv("DR_FRESH_TARGET_CLEAR")) != 0;
+        if (!target.freshColor)
+            return;
+        target.freshColor = false;
+        if (!enabled || target.color == nullptr || target.framebuffer == nullptr)
+            return;
+        HostTarget::PendingClear clear;
+        clear.rect = RenderRect(0, 0, int32_t(target.width), int32_t(target.height));
+        clear.flags = 0x100;
+        clear.color = RenderColor(0.0f, 0.0f, 0.0f, 0.0f);
+        if (target.pendingClears.empty())
+            g_pendingClearTargets.push_back(&target);
+        target.pendingClears.insert(target.pendingClears.begin(), clear); // the game's clears after it
+        static uint32_t logged;
+        if (logged++ < 20)
+            LOGFN("[renderer] new colour target {}x{} (format {}) starts black", target.width, target.height, uint32_t(target.format));
+    }
+
     void ApplyClearsFor(RenderCommandList* list, HostTarget& target, RenderFramebuffer* framebuffer)
     {
         for (HostTarget* other : std::vector<HostTarget*>(g_pendingClearTargets))
@@ -4807,6 +5080,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         const int32_t x1 = std::clamp(ScaleEdge(cmd.sourceRect[2] + offsetX, scale), x0, int32_t(target.width));
         const int32_t y1 = std::clamp(ScaleEdge(cmd.sourceRect[3] + offsetY, scale), y0, int32_t(target.height));
         const bool fromDepth = (cmd.resolveFlags & 7) == 4;
+        ClearFreshTarget(target);
         ApplyClearsOverlapping(list, target, RenderRect(x0, y0, x1, y1)); // earlier clears of this region first
 
         // On by default (the EDRAM restore and the shadow maps read them); DR_NO_DEPTH_RESOLVE=1 skips them.
@@ -5281,6 +5555,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                     target.pendingClears.clear(); // new storage: the old contents are gone anyway
                     std::erase(g_pendingClearTargets, &target);
                 }
+                ClearFreshTarget(target);
                 ApplyClearsFor(list, target, framebuffer);
                 TransitionForDrawing(list, target);
                 list->setFramebuffer(framebuffer);
@@ -5937,6 +6212,7 @@ bool Renderer::Init(RenderDevice* device, bool vulkan, RenderFormat backBufferFo
         }
     }
 
+    LoadPipelineList(); // pipelines of earlier runs, made in the background
     g_rendererActive = true;
     LOGFN("[renderer] ready ({}){}", vulkan ? "Vulkan" : "D3D12",
         g_dumpInterval != 0 ? fmt::format(", dumping render targets every {} frames", g_dumpInterval) : std::string());
@@ -6367,4 +6643,44 @@ uint32_t Renderer::PipelineCount()
 {
     std::lock_guard lock(g_pipelineMutex);
     return uint32_t(g_pipelines.size());
+}
+
+void Renderer::SavePipelineList(bool now)
+{
+    static auto lastSave = std::chrono::steady_clock::now();
+    std::vector<PipelineRecipe> recipes;
+    {
+        std::lock_guard lock(g_recipeMutex);
+        if (!g_recipesDirty || (!now && std::chrono::steady_clock::now() - lastSave < std::chrono::seconds(30)))
+            return;
+        recipes = g_recipes;
+        g_recipesDirty = false;
+    }
+    lastSave = std::chrono::steady_clock::now();
+    const std::filesystem::path path = PipelineListPath();
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        const uint32_t header[4] = { kRecipeMagic, kRecipeVersion, uint32_t(sizeof(PipelineRecipe)), uint32_t(recipes.size()) };
+        file.write(reinterpret_cast<const char*>(header), sizeof(header));
+        file.write(reinterpret_cast<const char*>(recipes.data()), std::streamsize(recipes.size() * sizeof(PipelineRecipe)));
+        if (!file)
+            return;
+    }
+    std::filesystem::rename(temporary, path, error);
+    LOGFN("[renderer] pipeline list saved: {} pipelines (made in the background next time)", recipes.size());
+}
+
+Renderer::PipelineStats Renderer::TakePipelineStats()
+{
+    PipelineStats p;
+    p.made = g_perfPipelinesMade.exchange(0);
+    p.ns = g_perfPipelineNs.exchange(0);
+    p.maxNs = g_perfPipelineMaxNs.exchange(0);
+    p.queued = uint64_t(std::max<int64_t>(0, g_perfPipelinesQueued.load()));
+    p.skippedDraws = g_perfSkippedDraws.exchange(0);
+    return p;
 }
