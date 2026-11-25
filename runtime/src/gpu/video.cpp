@@ -13,6 +13,7 @@
 #include <profiler/cpu_sampler.h>
 #include <os/hang_watchdog.h>
 #include <os/memory_info.h>
+#include <os/thread_qos.h>
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -611,6 +612,7 @@ namespace
     void RenderLoop()
     {
         CpuSampler::RegisterCurrentThread(kRenderThread ? "render thread" : "video thread"); // DR_CPU_PROFILE=1
+        CpuSampler::WatchHitchThread(kRenderThread ? "render thread" : "video thread"); // "[hitch profile]", iOS "[cpu]"
         g_stageMark = std::chrono::steady_clock::now();
         while (true)
         {
@@ -639,6 +641,7 @@ namespace
     void* RenderThreadMain(void*)
     {
         pthread_setname_np("render");
+        SetThreadInteractive(); // os/thread_qos.h
         HangWatchdog::PrepareThread(); // crash reports, also of a stack overflow
         InitRenderer();
         g_initOk = true;

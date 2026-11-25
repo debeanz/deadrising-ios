@@ -179,6 +179,23 @@ the same):
 With these, 4X MSAA costs little (1080p: 459 / 636 MB with it, a little less without). Still to look
 at: the CPU side (the draw hooks take 7-17 ms a frame on the phone).
 
+Build 22 on the iPhone 15 (720p): the GPU waits 0.2-2 ms a frame now; the game thread is the limit. The draw
+hooks (the renderer recording the game's draws) took 15-32 ms a frame there against 3-6 ms on a PC, mostly
+"prepare" (14.9 ms a frame on average). Four replays took 1.1-2.1 s, all making new pipelines (MoltenVK compiles
+Metal shaders on first use): the game stopped (the cutscene stutter; its clock stood still while the dialogue
+played on), and the next frame replaced the one not yet taken, losing its texture uploads (Carlito and the roof
+door stayed white). Build 23:
+
+* the game waits up to 30 s (not 1 s) for the video thread to take a frame; a frame dropped all the same makes
+  every texture be checked and uploaded again;
+* iPhone / iPad: a draw whose pipeline is still being made waits at most 4 ms a frame in all, then is skipped
+  until the pipeline is ready (`DR_ASYNC_PIPELINES`: 0 always waits, 1 skips on a PC too);
+* the game's threads, the render thread and the GPU command processor ask for the fast cores
+  (`os/thread_qos.h`, QoS user-interactive);
+* `[cpu]` lines every 10 s on Apple platforms: a sampling profile (every 2 ms) of the game thread, the drawing
+  thread, the render thread and the command processor, functions by self and total time
+  (`profiler/cpu_sampler.cpp`; `DR_HITCH_PROFILE=0` off). The next step for the draw hooks comes from these.
+
 ## Screen scaling and widescreen
 
 Screen Scaling (start screen and Settings; `ScreenScaling` in recomp_config.toml): Fit (the game's

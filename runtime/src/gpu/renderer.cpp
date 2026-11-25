@@ -3263,13 +3263,16 @@ void Renderer::OnPresent(uint32_t device)
     }
     {
         // A frame must not be replaced before the video thread took it: it carries one-time
-        // texture uploads (and resolves later frames rely on). Wait for it (bounded, so a stalled
-        // window cannot hang the game).
+        // texture uploads (and resolves later frames rely on). Wait for it, up to 30 s (a stalled
+        // device must not hang the game for ever). It was 1 s: on the iPhone the replay of a frame
+        // that makes 30 new pipelines took 1-2 s, the next frame replaced it, and the textures it was
+        // to upload stayed white (2026-11-25: Carlito and the roof door).
         std::unique_lock lock(g_frameMutex);
         const auto waitStart = std::chrono::steady_clock::now();
         // iOS in the background: rendering is paused (gpu/video.cpp), and the game waits with it.
         if (g_rendererActive)
-            while (!g_frameTaken.wait_for(lock, std::chrono::seconds(1), [] { return !g_pendingValid; }) && Video::RenderingPaused())
+            while (!g_frameTaken.wait_for(lock, std::chrono::seconds(1), [] { return !g_pendingValid; }) &&
+                   (Video::RenderingPaused() || std::chrono::steady_clock::now() - waitStart < std::chrono::seconds(30)))
             {
             }
         const uint32_t waitUs = uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count());
@@ -3326,6 +3329,17 @@ void Renderer::OnPresent(uint32_t device)
                     entry.stableFrames = 0;
                 }
             LOGN_WARNING("[renderer] a frame with geometry uploads was dropped: resident geometry reset");
+        }
+        if (g_pendingValid)
+        {
+            // The video thread did not take the last frame for 30 s: its texture uploads are lost with it.
+            // Every texture is checked again and uploaded when next used (none stays white).
+            for (auto& [key, entry] : g_textureCache)
+            {
+                entry.sample = 0;
+                entry.checkedFrame = UINT32_MAX;
+            }
+            LOGN_WARNING("[renderer] a frame was dropped (the video thread stalled 30 s): its texture uploads are made again");
         }
         std::swap(g_recording, g_pending);
         g_pendingValid = true;
@@ -3685,6 +3699,27 @@ namespace
     std::condition_variable g_pipelineReady;
     ankerl::unordered_dense::map<uint64_t, std::unique_ptr<PipelineSlot>> g_pipelines;
     std::atomic<uint32_t> g_newPipelines{ 0 }; // made since the current replay began
+
+    // iPhone / iPad: MoltenVK compiles Metal shaders the first time a pipeline is made: up to 2 s for the new
+    // pipelines of a cutscene (2026-11-25). Waiting for them stopped the game (its clock too: the dialogue ran
+    // ahead of the faces). There a draw whose pipeline (requested at present, RequestPipelines) is still being made
+    // waits at most 4 ms a frame in all, then is skipped this frame; it is drawn once the pipeline is ready.
+    // DR_ASYNC_PIPELINES=0 always waits; =1 skips on a PC too.
+    bool AsyncPipelines()
+    {
+        static const bool async = [] {
+            if (const char* value = getenv("DR_ASYNC_PIPELINES"))
+                return atoi(value) != 0;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+            return true;
+#else
+            return false;
+#endif
+        }();
+        return async;
+    }
+    std::chrono::steady_clock::time_point g_pipelineDeadline = std::chrono::steady_clock::time_point::max(); // Replay sets it
+    uint32_t g_pipelineSkippedDraws = 0; // draws skipped because their pipeline was being made (video thread)
     std::atomic<uint32_t> g_pipelinesFailed{ 0 };
 
     class WorkerPool
@@ -3983,7 +4018,16 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 if (!slot->ready)
                 {
                     HitchStats::Timer timer(HitchStats::Pipelines);
-                    g_pipelineReady.wait(lock, [slot] { return slot->ready; });
+                    if (AsyncPipelines())
+                    {
+                        if (!g_pipelineReady.wait_until(lock, g_pipelineDeadline, [slot] { return slot->ready; }))
+                        {
+                            g_pipelineSkippedDraws++;
+                            return nullptr; // drawn once the pipeline is ready
+                        }
+                    }
+                    else
+                        g_pipelineReady.wait(lock, [slot] { return slot->ready; });
                 }
                 return slot->pipeline.get();
             }
@@ -5139,6 +5183,18 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             }
             passesBefore = now;
         };
+        g_pipelineDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
+        {
+            static uint32_t frames = 0, skipped = 0;
+            skipped += g_pipelineSkippedDraws;
+            g_pipelineSkippedDraws = 0;
+            if (++frames % 300 == 0 && skipped != 0)
+            {
+                LOGFN("[renderer] {} draws in the last 300 frames waited for their pipeline (skipped until it was made)", skipped);
+                skipped = 0;
+            }
+        }
+
         g_gpuProfile.Begin(list);
         // The size each run of draws and clears into one target needs (the largest of its commands, host pixels),
         // so the run keeps one framebuffer and one render pass (FramebufferFor). A resolve or an upload ends a run.

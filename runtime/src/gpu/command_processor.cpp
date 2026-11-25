@@ -8,6 +8,7 @@
 #include <kernel/memory.h>
 #include <os/logger.h>
 #include <profiler/cpu_sampler.h>
+#include <os/thread_qos.h>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -405,6 +406,7 @@ namespace
 
     void CommandProcessorThread()
     {
+        SetThreadInteractive(); // os/thread_qos.h
         CpuSampler::RegisterCurrentThread("command processor"); // DR_CPU_PROFILE=1
         CpuSampler::WatchHitchThread("command processor"); // "[hitch profile]"
         uint32_t rptr = 0;

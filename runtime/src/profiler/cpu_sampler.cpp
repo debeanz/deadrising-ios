@@ -488,6 +488,218 @@ void CpuSampler::LogStack(const void* context)
             named ? displacement : 0, frames[i] - exeBase);
     }
 }
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <cxxabi.h>
+#include <unistd.h>
+
+// Apple (iPhone, iPad): the CPU profile of the threads the frame waits for. A sampler thread stops each watched thread
+// every 2 ms, reads its call stack (frame-pointer chain) and lets it go on; every 10 s it logs, per thread,
+// the functions with the most samples ("[cpu]": self = where the thread was, total = anywhere on its stack), runtime and
+// recompiled game functions (sub_XXXXXXXX) alike. 2026-11-25: the iPhone's draw hooks took 5 times a PC's; this says
+// where. DR_HITCH_PROFILE=0 turns it off. Nothing is allocated or locked while a thread is stopped.
+namespace
+{
+    constexpr int kThreads = 6, kMaxDepth = 40;
+    constexpr uintptr_t kAddressMask = 0x0000000FFFFFFFFFull; // no pointer authentication bits
+
+    struct Watched
+    {
+        char name[48] = {};
+        mach_port_t thread = MACH_PORT_NULL;
+        uintptr_t low = 0, high = 0;
+    };
+    Watched g_watched[kThreads];
+    std::atomic<int> g_watchedCount{ 0 };
+    std::mutex g_watchMutex;
+
+    bool Enabled()
+    {
+        static const bool enabled = getenv("DR_HITCH_PROFILE") == nullptr || atoi(getenv("DR_HITCH_PROFILE")) != 0;
+        return enabled;
+    }
+
+    struct Symbol
+    {
+        uintptr_t start = 0;
+        std::string name;
+    };
+
+    // The function an address is in (dladdr: the executable keeps its symbols), demangled and without its parameters.
+    const Symbol& Lookup(uintptr_t pc, std::unordered_map<uintptr_t, Symbol>& cache)
+    {
+        auto it = cache.find(pc);
+        if (it != cache.end())
+            return it->second;
+        Symbol symbol;
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(pc), &info) != 0 && info.dli_sname != nullptr)
+        {
+            symbol.start = uintptr_t(info.dli_saddr);
+            int status = 0;
+            char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+            std::string name = status == 0 && demangled != nullptr ? demangled : info.dli_sname;
+            free(demangled);
+            // Without the parameter list (but not cutting "(anonymous namespace)").
+            for (size_t i = 1; i < name.size(); i++)
+                if (name[i] == '(' && name.compare(i, 21, "(anonymous namespace)") != 0)
+                {
+                    name.resize(i);
+                    break;
+                }
+            const std::string anonymous = "(anonymous namespace)::";
+            for (size_t at; (at = name.find(anonymous)) != std::string::npos;)
+                name.erase(at, anonymous.size());
+            symbol.name = name.size() > 70 ? name.substr(0, 70) : name;
+        }
+        else
+        {
+            symbol.start = pc;
+            const char* file = info.dli_fname ? strrchr(info.dli_fname, '/') : nullptr;
+            symbol.name = fmt::format("{}+{:X}", file ? file + 1 : "?", info.dli_fbase ? pc - uintptr_t(info.dli_fbase) : pc);
+        }
+        return cache.emplace(pc, std::move(symbol)).first->second;
+    }
+
+    struct Profile
+    {
+        uint32_t samples = 0;
+        std::unordered_map<uintptr_t, uint32_t> self;  // innermost pc -> samples
+        std::vector<uintptr_t> stacks;                  // every sample's frames, 0-terminated (symbolized at report)
+    };
+
+    void Report(const Watched& watched, Profile& profile, std::unordered_map<uintptr_t, Symbol>& cache)
+    {
+        if (profile.samples == 0)
+            return;
+        std::unordered_map<std::string, uint32_t> self, total;
+        for (const auto& [pc, count] : profile.self)
+            self[Lookup(pc, cache).name] += count;
+        std::vector<std::string_view> seen;
+        for (size_t i = 0; i < profile.stacks.size(); i++)
+        {
+            if (profile.stacks[i] == 0)
+            {
+                seen.clear();
+                continue;
+            }
+            const std::string& name = Lookup(profile.stacks[i], cache).name;
+            if (std::find(seen.begin(), seen.end(), std::string_view(name)) == seen.end()) // once per sample (recursion)
+            {
+                seen.push_back(name);
+                total[name]++;
+            }
+        }
+        auto top = [&](const std::unordered_map<std::string, uint32_t>& counts, size_t n) {
+            std::vector<std::pair<uint32_t, const std::string*>> sorted;
+            for (const auto& [name, count] : counts)
+                sorted.emplace_back(count, &name);
+            std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string text;
+            for (size_t i = 0; i < sorted.size() && i < n; i++)
+                text += fmt::format("{}{:.0f}% {}", i ? ", " : "", 100.0 * sorted[i].first / profile.samples, *sorted[i].second);
+            return text;
+        };
+        LOGFN("[cpu] {}: {} samples; self {}", watched.name, profile.samples, top(self, 14));
+        LOGFN("[cpu] {}: total {}", watched.name, top(total, 22));
+    }
+
+    void SamplerThread()
+    {
+        pthread_setname_np("cpu sampler");
+        std::unordered_map<uintptr_t, Symbol> cache;
+        Profile profiles[kThreads];
+        auto lastReport = std::chrono::steady_clock::now();
+        while (true)
+        {
+            usleep(2000);
+            const int count = g_watchedCount.load(std::memory_order_acquire);
+            for (int i = 0; i < count; i++)
+            {
+                const Watched& watched = g_watched[i];
+                uintptr_t frames[kMaxDepth];
+                int depth = 0;
+                if (thread_suspend(watched.thread) != KERN_SUCCESS)
+                    continue;
+#if defined(__arm64__) || defined(__aarch64__)
+                arm_thread_state64_t state{};
+                mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
+                if (thread_get_state(watched.thread, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &stateCount) == KERN_SUCCESS)
+                {
+                    frames[depth++] = uintptr_t(arm_thread_state64_get_pc(state)) & kAddressMask;
+                    frames[depth++] = uintptr_t(arm_thread_state64_get_lr(state)) & kAddressMask;
+                    uintptr_t fp = uintptr_t(arm_thread_state64_get_fp(state));
+                    while (depth < kMaxDepth && fp >= watched.low && fp + 16 <= watched.high && (fp & 7) == 0)
+                    {
+                        const uintptr_t next = *reinterpret_cast<const uintptr_t*>(fp);
+                        const uintptr_t ret = *reinterpret_cast<const uintptr_t*>(fp + 8) & kAddressMask;
+                        if (ret == 0)
+                            break;
+                        frames[depth++] = ret;
+                        if (next <= fp)
+                            break;
+                        fp = next;
+                    }
+                }
+#endif
+                thread_resume(watched.thread);
+                if (depth == 0)
+                    continue;
+                Profile& profile = profiles[i];
+                profile.samples++;
+                profile.self[frames[0]]++;
+                profile.stacks.insert(profile.stacks.end(), frames, frames + depth);
+                profile.stacks.push_back(0);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastReport >= std::chrono::seconds(10))
+            {
+                lastReport = now;
+                for (int i = 0; i < count; i++)
+                {
+                    Report(g_watched[i], profiles[i], cache);
+                    profiles[i] = Profile{};
+                }
+            }
+        }
+    }
+}
+
+void CpuSampler::WatchHitchThread(const char* name)
+{
+    if (!Enabled())
+        return;
+    std::lock_guard lock(g_watchMutex);
+    const mach_port_t self = pthread_mach_thread_np(pthread_self());
+    const int count = g_watchedCount.load();
+    for (int i = 0; i < count; i++)
+        if (g_watched[i].thread == self)
+            return;
+    if (count >= kThreads)
+        return;
+    Watched& watched = g_watched[count];
+    strncpy(watched.name, name, sizeof(watched.name) - 1);
+    watched.thread = self;
+    watched.high = uintptr_t(pthread_get_stackaddr_np(pthread_self()));
+    watched.low = watched.high - pthread_get_stacksize_np(pthread_self());
+    g_watchedCount.store(count + 1, std::memory_order_release);
+    if (count == 0)
+    {
+        std::thread(SamplerThread).detach();
+        LOGN("[cpu] CPU profile of the frame's threads every 10 s (DR_HITCH_PROFILE=0 off)");
+    }
+}
+
+void CpuSampler::WatchHitches()
+{
+    WatchHitchThread("game thread (presents)");
+}
+
+void CpuSampler::ReportHitch(uint32_t, std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point) {}
+void CpuSampler::RegisterCurrentThread(const char*) {}
+void CpuSampler::LogStack(const void*) {}
 #else
 void CpuSampler::WatchHitches() {}
 void CpuSampler::WatchHitchThread(const char*) {}
