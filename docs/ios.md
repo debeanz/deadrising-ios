@@ -275,6 +275,24 @@ let it go (null). Build 28:
   do not depend on the device or the API (the PC's D3D12 and Vulkan lists matched record for record), so lists
   from the PC and from the phone can be merged into it.
 
+Build 28 on the iPhone 15, the roof: 60 fps for 5-20 s at 2.7 W of CPU, half of it on the performance cores; then
+2% of the cycles there at 0.6 W and 27-33 fps, the thermal state still "nominal". Apple's talk on CPU scheduling for
+games: each cluster of cores is switched off or slowed "depending on the current thermal pressure for that cluster",
+so the two performance cores are taken away while the phone as a whole is not hot. What keeps them is less work a
+frame. On the roof (about 2500 draws a frame) the drawing thread spent 46% of its time preparing draws: copying
+constants, hashing buffers, reading the clock. Build 29:
+
+* each draw copies only the shader constants its shaders read: XenosRecomp records in the shader cache the end of
+  the float registers a shader reads (`floatConstantsEnd`; all of them when it indexes them relatively), the
+  renderer copies that many (`DR_FULL_CONSTANTS=1`: all, as before). Before, every draw copied all 256 vertex and
+  224 pixel registers (7.5 KB): most of the roof's 11-17 MB of frame data. 523 of the 777 shaders read 35 registers
+  or fewer. PC, the same frame dumped both ways: mean difference 0.06 of 255 (animation);
+* vertex and index buffers unchanged for 30 frames are checked by 16 samples of 64 bytes a frame and in full every
+  16th frame (`DR_FULL_HASH=1`: in full every frame);
+* the draw hooks' timers read the CPU's counter (`os/fast_clock.h`) instead of `steady_clock` (6% of the thread);
+* Sleep(0), the lock hand-over and spin locks no longer call `sched_yield` on Apple platforms: it parks the thread
+  for up to 10 ms with its priority at zero (lock hand-overs took 11 ms each); a 50 us sleep instead.
+
 The real fix for shader compiling on the device is the native Metal path: Metal shaders compiled when the IPA is
 built (XenosRecomp-metal makes them, plume has a Metal backend; the UnleashedRecomp iOS port works this way), so
 the device only links pipelines (milliseconds) and MoltenVK's translation leaves the render thread.

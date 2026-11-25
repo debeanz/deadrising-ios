@@ -581,6 +581,28 @@ uint32_t RtlUnicodeToMultiByteN(char* MultiByteString, uint32_t MaxBytesInMultiB
     return STATUS_SUCCESS;
 }
 
+// Letting other threads have the core for a moment (Sleep(0), a lock handed to a starved waiter, a spin lock held by
+// another thread). Apple: sched_yield (std::this_thread::yield) parks the thread for up to 10 ms with its priority
+// dropped to zero (Apple, "Tune CPU job scheduling for Apple silicon games"); 2026-11-26, iPhone: each lock hand-over
+// took 11 ms, and the game's main thread spent 5% in it. A 50 us sleep there instead keeps the thread's priority.
+static void YieldBriefly()
+{
+#if defined(__APPLE__)
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+#else
+    std::this_thread::yield();
+#endif
+}
+
+static inline void CpuPause()
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ __volatile__("yield"); // the instruction (a hint to the core), not the system call
+#endif
+}
+
 uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
     if (Alertable && DeliverUserApcs())
@@ -592,7 +614,7 @@ uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* 
     Sleep(timeout);
 #else
     if (timeout == 0)
-        std::this_thread::yield();
+        YieldBriefly();
     else
         std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
 #endif
@@ -771,7 +793,7 @@ namespace
         const auto start = std::chrono::steady_clock::now();
         while (waiters.load(std::memory_order_relaxed) > 0 && !taken() &&
             std::chrono::steady_clock::now() - start < std::chrono::microseconds(500))
-            std::this_thread::yield();
+            YieldBriefly();
         static std::atomic<uint32_t> handOvers{ 0 };
         static std::atomic<uint64_t> waitedUs{ 0 };
         waitedUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
@@ -889,6 +911,7 @@ static void AcquireSpinLock(uint32_t* spinLock)
     LetWaitersIn(spinLock, [&] { return spinLockRef.load(std::memory_order_relaxed) != 0; });
 
     bool waiting = false;
+    uint32_t spins = 0;
     while (true)
     {
         uint32_t expected = 0;
@@ -900,7 +923,11 @@ static void AcquireSpinLock(uint32_t* spinLock)
             waiting = true;
             StartWaiting(spinLock);
         }
-        std::this_thread::yield();
+        // A spin lock is held for a moment: spin a little first, then give the core away.
+        if (++spins < 256)
+            CpuPause();
+        else
+            YieldBriefly();
     }
     if (waiting)
         StopWaiting(spinLock);

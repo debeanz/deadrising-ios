@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <os/fast_clock.h>
 #include <cstdint>
 
 // Where a long frame's time went ("[hitch]" lines, gpu/renderer.cpp): file reads, texture decodes
@@ -58,8 +59,8 @@ namespace HitchStats
     {
         Kind kind;
         uint64_t bytes = 0;
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        uint64_t start = FastClock::Ticks(); // os/fast_clock.h: these time every draw
         explicit Timer(Kind kind) : kind(kind) {}
-        ~Timer() { Add(kind, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), bytes); }
+        ~Timer() { Add(kind, FastClock::ToNs(FastClock::Ticks() - start) / 1000, bytes); }
     };
 }

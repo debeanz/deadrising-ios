@@ -21,6 +21,7 @@
 #include <os/hang_watchdog.h>
 #include <os/memory_info.h>
 #include <profiler/cpu_sampler.h>
+#include <os/fast_clock.h>
 
 #include <cfloat>
 #include <cmath>
@@ -664,6 +665,7 @@ namespace
         uint32_t recordedFrame = UINT32_MAX, lastUsed = 0;
         uint32_t offset = 0, auxOffset = 0; // in the frame recorded as recordedFrame
         uint32_t stableFrames = 0;          // frames in a row its data was unchanged at the first draw
+        uint64_t sample = 0;                // QuickSample of the data 'hash' is of
         std::vector<uint8_t> converted, aux; // host-order vertices and decoded auxiliary stream
         uint32_t resident = kNotResident, residentAux = kNotResident; // regions in the geometry buffer
         uint32_t residentSize = 0, residentAuxSize = 0;
@@ -689,6 +691,7 @@ namespace
         uint32_t minIndex = 0, maxIndex = 0;
         uint32_t recordedFrame = UINT32_MAX, lastUsed = 0, offset = 0;
         uint32_t stableFrames = 0;
+        uint64_t sample = 0; // QuickSample of the indices 'hash' is of
         std::vector<uint32_t> rebased;
         uint32_t resident = kNotResident, residentSize = 0;
         bool offsetResident = false;
@@ -810,6 +813,34 @@ namespace
         for (uint32_t i = 0; i < 16; i++)
             hash = XXH3_64bits_withSeed(data + uint64_t(size - 256) * i / 15, 256, hash);
         return hash;
+    }
+
+    // ---- Buffers unchanged for a long time are checked by a sample (2026-11-25): every vertex and index buffer on
+    // screen was hashed in full at its first draw of each frame, about 15% of the iPhone's drawing thread on the roof
+    // (2500 draws a frame). After kTrustFrames frames unchanged, a buffer's first draw of a frame hashes 16 pieces of
+    // 64 bytes spread over it; the whole buffer again every 16th frame (each buffer on its own frame). A model loaded
+    // into the same memory changes the samples at once; a buffer rewritten in part shows within 16 frames.
+    // DR_FULL_HASH=1: every buffer in full every frame, as before.
+    constexpr uint32_t kTrustFrames = 30;
+
+    uint64_t QuickSample(const uint8_t* data, uint32_t size)
+    {
+        if (size <= 1024)
+            return XXH3_64bits(data, size);
+        uint64_t hash = size;
+        for (uint32_t i = 0; i < 16; i++)
+            hash = XXH3_64bits_withSeed(data + uint64_t(size - 64) * i / 15, 64, hash);
+        return hash;
+    }
+
+    // The hash of a buffer that is cached as 'hash' (with its 'sample'): the cached hash when it can be trusted.
+    uint64_t BufferHash(const uint8_t* data, uint32_t size, uint32_t address, bool valid, uint32_t stableFrames, uint64_t cachedHash, uint64_t& sample)
+    {
+        static const bool fullHash = getenv("DR_FULL_HASH") != nullptr && atoi(getenv("DR_FULL_HASH")) != 0;
+        if (!fullHash && valid && stableFrames >= kTrustFrames && ((g_guestFrame + (address >> 6)) & 15) != 0 && QuickSample(data, size) == sample)
+            return cachedHash;
+        sample = QuickSample(data, size);
+        return XXH3_64bits(data, size);
     }
 
     uint32_t ResolveDescriptor(uint32_t address);
@@ -1580,10 +1611,10 @@ namespace
     // Time spent in the renderer's D3D hooks on the guest thread (recording draws, copying data).
     struct HookTimer
     {
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        uint64_t start = FastClock::Ticks();
         ~HookTimer()
         {
-            const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+            const uint64_t us = FastClock::ToNs(FastClock::Ticks() - start) / 1000;
             g_timing.hookUs += us;
             HitchStats::Add(HitchStats::Hooks, us);
         }
@@ -1596,11 +1627,11 @@ namespace
     struct StageTimer
     {
         Stage stage;
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        uint64_t start = FastClock::Ticks();
         explicit StageTimer(Stage s) : stage(s) {}
         ~StageTimer()
         {
-            const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            const uint64_t ns = FastClock::ToNs(FastClock::Ticks() - start);
             g_stageNs[stage] += ns;
             g_frameStageNs[stage] += ns;
         }
@@ -1674,9 +1705,22 @@ namespace
         cmd.streamMask |= 1u << slot;
     }
 
+    // The registers a draw's shader reads (XenosRecomp's floatConstantsEnd), in bytes: each draw copies only those
+    // (2026-11-25: every draw copied all 256 vertex and 224 pixel registers, 7.5 KB; on the iPhone's roof, 2500 draws
+    // a frame, that was most of the frame's 11-17 MB, copied, byte-swapped and uploaded 60 times a second).
+    // DR_FULL_CONSTANTS=1: all of them, as before.
+    uint32_t ConstantBytes(const ShaderCacheEntry* shader, uint32_t registers)
+    {
+        static const bool full = getenv("DR_FULL_CONSTANTS") != nullptr && atoi(getenv("DR_FULL_CONSTANTS")) != 0;
+        if (full || shader == nullptr || shader->floatConstantsEnd == 0)
+            return registers * 16;
+        return std::min(shader->floatConstantsEnd, registers) * 16;
+    }
+
     uint32_t RecordConstants(Frame& frame, ConstantCache& cache, const void* source, uint32_t size, bool swap)
     {
-        if (cache.offset != UINT32_MAX && cache.raw.size() == size && memcmp(cache.raw.data(), source, size) == 0)
+        // The last copy holds at least these registers, unchanged: it serves this draw too.
+        if (cache.offset != UINT32_MAX && cache.raw.size() >= size && memcmp(cache.raw.data(), source, size) == 0)
             return cache.offset;
 
         cache.raw.assign(static_cast<const uint8_t*>(source), static_cast<const uint8_t*>(source) + size);
@@ -1987,8 +2031,9 @@ namespace
         }
 
         // Constants.
-        cmd.vertexConstants = RecordConstants(frame, g_vsCache, g_memory.Translate(device + VertexShaderConstants), 256 * 16, true);
-        cmd.pixelConstants = RecordConstants(frame, g_psCache, g_memory.Translate(device + PixelShaderConstants), 224 * 16, true);
+        cmd.vertexConstants = RecordConstants(frame, g_vsCache, g_memory.Translate(device + VertexShaderConstants), ConstantBytes(key.vertexShader, 256), true);
+        const uint32_t pixelConstantBytes = ConstantBytes(key.pixelShader, 224);
+        cmd.pixelConstants = RecordConstants(frame, g_psCache, g_memory.Translate(device + PixelShaderConstants), pixelConstantBytes, true);
 
         // The EDRAM restore pair (PS F3F97E7B, then E52354E8 undoes it) moves pixels around inside
         // 4x4 blocks: position = texcoord x c4.xy (the screen in pixels), integer part permuted,
@@ -2002,8 +2047,8 @@ namespace
             const float scale = PassScale(cmd.width, cmd.height, frame.scale);
             if (scale != 1.0f)
             {
-                const uint32_t copy = frame.Allocate(224 * 16, 256);
-                memcpy(frame.data.data() + copy, frame.data.data() + cmd.pixelConstants, 224 * 16);
+                const uint32_t copy = frame.Allocate(std::max(pixelConstantBytes, 5u * 16), 256);
+                memcpy(frame.data.data() + copy, frame.data.data() + cmd.pixelConstants, pixelConstantBytes);
                 float* c4 = reinterpret_cast<float*>(frame.data.data() + copy + 4 * 16);
                 c4[0] *= scale;
                 c4[1] *= scale;
@@ -2291,7 +2336,7 @@ namespace
             // A stream unchanged for several frames, drawn again in this frame (shadow map, depth
             // pre-pass, colour pass): not hashed again. Streams that change are hashed every draw.
             const bool again = cached.valid && cached.recordedFrame == g_guestFrame && cached.stableFrames >= 4;
-            const uint64_t hash = again ? cached.hash : XXH3_64bits(guest, size);
+            const uint64_t hash = again ? cached.hash : BufferHash(guest, size, uint32_t(source), cached.valid, cached.stableFrames, cached.hash, cached.sample);
             if (!again && cached.lastUsed != g_guestFrame)
                 cached.stableFrames = cached.valid && cached.hash == hash ? cached.stableFrames + 1 : 0;
             cached.lastUsed = g_guestFrame;
@@ -2587,7 +2632,7 @@ void Renderer::OnDrawIndexed(uint32_t device, uint32_t primitive, int32_t baseVe
     auto& entry = g_indexCache[IndexKey{ address, indexCount, primitive | (is32 ? 0x100u : 0u) }];
     // As for vertex streams: an index list unchanged for several frames is hashed once a frame.
     const bool again = entry.valid && entry.lastUsed == g_guestFrame && entry.stableFrames >= 4;
-    const uint64_t rawHash = again ? entry.hash : XXH3_64bits(rawIndices, size_t(indexCount) * (is32 ? 4 : 2));
+    const uint64_t rawHash = again ? entry.hash : BufferHash(rawIndices, indexCount * (is32 ? 4 : 2), address, entry.valid, entry.stableFrames, entry.hash, entry.sample);
     if (!again && entry.lastUsed != g_guestFrame)
         entry.stableFrames = entry.valid && entry.hash == rawHash ? entry.stableFrames + 1 : 0;
     entry.lastUsed = g_guestFrame;

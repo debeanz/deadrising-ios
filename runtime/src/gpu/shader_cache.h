@@ -15,6 +15,7 @@ struct ShaderCacheEntry
     const uint32_t spirvSize;
     const uint32_t specConstantsMask;
     const uint32_t pixelOutputs;   // Dead Rising: colour targets 0-3 (bits 0-3) and depth (bit 4) a pixel shader writes
+    const uint32_t floatConstantsEnd; // Dead Rising: the float constants it reads are below this register (0: unknown, all)
     struct HostShader* hostShader; // runtime state (gpu/shaders.cpp), null until first use
 };
 
