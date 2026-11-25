@@ -2464,7 +2464,14 @@ void Renderer::OnCreateVertexDeclaration(uint32_t elements, uint32_t declaration
         const uint32_t guestFormat = type & 0x3F;
         const bool packed = guestFormat == 7 || guestFormat == 16 || guestFormat == 17;
         const bool rawFloatInput = IsUintUsage(element.usage) && element.usage != USAGE_BLENDINDICES && element.info.kind != Kind::Float;
-        if ((packed || rawFloatInput) && stream < kAuxSlotBase)
+        // Integer formats (UBYTE4, SHORT2/4 as UINT / SINT) feeding float4 inputs: the console fetches them as float
+        // values (0..255). Desktop drivers passed the raw integers; MoltenVK refuses the pipeline ("vertex attribute
+        // type mismatch", 2026-11-25: the title screen's TEXCOORD1/2 as UBYTE4).
+        const RenderFormat f = element.info.format;
+        const bool integerFormat = f == RenderFormat::R8G8B8A8_UINT || f == RenderFormat::R8G8B8A8_SINT || f == RenderFormat::R16G16_SINT ||
+            f == RenderFormat::R16G16B16A16_SINT || f == RenderFormat::R32_UINT;
+        const bool integerIntoFloat = !IsUintUsage(element.usage) && integerFormat;
+        if ((packed || rawFloatInput || integerIntoFloat) && stream < kAuxSlotBase)
         {
             element.converted = true;
             element.auxOffset = decl->auxStride[stream];
@@ -5678,9 +5685,11 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
         freedTextures = uint32_t(done.textures.size());
         freedBuffers = uint32_t(done.buffers.size());
         const auto freeStart = Clock::now();
-        done.textures.clear();
+        // Framebuffers and views before the textures they point at (plume's framebuffer keeps a view of its depth
+        // texture; freed after it, the view read the freed texture: the iPhone build crashed there, 2026-11-25).
         done.framebuffers.clear();
         done.views.clear();
+        done.textures.clear();
         done.buffers.clear();
         freeUs = usSince(freeStart);
         const auto writeBackStart = Clock::now();

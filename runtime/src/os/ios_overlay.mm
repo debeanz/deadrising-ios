@@ -1058,14 +1058,8 @@ static void DRSetResolution(NSInteger i) /* the options menu's choices: 720p, 10
 }
 - (void)drTick:(CADisplayLink*)l
 {
-    // By itself while the game shows no picture for 3 s (starting, or stuck); gone again once pictures come.
+    // Only on a four-finger tap (the user asked, 2026-11-25: it no longer opens by itself while the game starts).
     [self drCheckMemory];
-    const double waited = Video::SecondsSinceGameFrame();
-    if (!_userOpen)
-    {
-        if (!_autoOpen && waited > 3.0) { _autoOpen = YES; DRLog(@"live log shown: no picture from the game"); }
-        else if (_autoOpen && waited < 1.0) _autoOpen = NO;
-    }
     [self drRefresh:NO];
     // the frame counter (Show FPS)
     _fps.hidden = !Config::ShowFps || (_userOpen || _autoOpen);

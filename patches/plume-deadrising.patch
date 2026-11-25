@@ -21,7 +21,7 @@ index 6e9619d..8657c4b 100644
          const D3D12PipelineLayout *pipelineLayout = static_cast<const D3D12PipelineLayout *>(desc.pipelineLayout);
          const D3D12Shader *vertexShader = static_cast<const D3D12Shader *>(desc.vertexShader);
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 194ed7f..8acde6d 100644
+index 194ed7f..56fed0f 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -13,6 +13,9 @@
@@ -74,7 +74,24 @@ index 194ed7f..8acde6d 100644
      // Backend constants.
  
      // Required buffer alignment for acceleration structures.
-@@ -1387,7 +1423,7 @@ namespace plume {
+@@ -1076,6 +1112,7 @@ namespace plume {
+         assert(desc.arrayIndex < texture->desc.arraySize);
+ 
+         this->texture = texture;
++        this->device = texture->device;
+         this->desc = desc;
+ 
+         const uint32_t mipLevels = std::min(desc.mipLevels, texture->desc.mipLevels - desc.mipSlice);
+@@ -1105,7 +1142,7 @@ namespace plume {
+ 
+     VulkanTextureView::~VulkanTextureView() {
+         if (vk != VK_NULL_HANDLE) {
+-            vkDestroyImageView(texture->device->vk, vk, nullptr);
++            vkDestroyImageView(device->vk, vk, nullptr);
+         }
+     }
+ 
+@@ -1387,7 +1424,7 @@ namespace plume {
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.stage = stageInfo;
  
@@ -83,7 +100,7 @@ index 194ed7f..8acde6d 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
              return;
-@@ -1646,7 +1682,7 @@ namespace plume {
+@@ -1646,7 +1683,7 @@ namespace plume {
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
  
@@ -92,7 +109,7 @@ index 194ed7f..8acde6d 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
              return;
-@@ -3202,6 +3238,8 @@ namespace plume {
+@@ -3202,6 +3239,8 @@ namespace plume {
              imageCopy.bufferRowLength = ((srcLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
              imageCopy.bufferImageHeight = ((srcLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
              imageCopy.imageSubresource.aspectMask = toAspectFlags(dstTexture->desc.format, dstTexture->desc.flags);
@@ -101,7 +118,7 @@ index 194ed7f..8acde6d 100644
              imageCopy.imageSubresource.baseArrayLayer = dstLocation.subresource.arrayIndex;
              imageCopy.imageSubresource.layerCount = 1;
              imageCopy.imageSubresource.mipLevel = dstLocation.subresource.mipLevel;
-@@ -3213,6 +3251,32 @@ namespace plume {
+@@ -3213,6 +3252,32 @@ namespace plume {
              imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
              vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
          }
@@ -134,7 +151,7 @@ index 194ed7f..8acde6d 100644
          else {
              VkImageCopy imageCopy = {};
              imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
-@@ -4137,6 +4201,27 @@ namespace plume {
+@@ -4137,6 +4202,27 @@ namespace plume {
          if (!nullDescriptorSupported) {
              nullBuffer = createBuffer(RenderBufferDesc::DefaultBuffer(16, RenderBufferFlag::VERTEX));
          }
@@ -162,7 +179,7 @@ index 194ed7f..8acde6d 100644
      }
  
      VulkanDevice::~VulkanDevice() {
-@@ -4156,11 +4241,19 @@ namespace plume {
+@@ -4156,11 +4242,19 @@ namespace plume {
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createComputePipeline(const RenderComputePipelineDesc &desc) {
@@ -184,7 +201,7 @@ index 194ed7f..8acde6d 100644
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
-@@ -4418,6 +4511,11 @@ namespace plume {
+@@ -4418,6 +4512,11 @@ namespace plume {
              allocator = VK_NULL_HANDLE;
          }
  
@@ -196,7 +213,7 @@ index 194ed7f..8acde6d 100644
          if (vk != VK_NULL_HANDLE) {
              vkDestroyDevice(vk, nullptr);
              vk = VK_NULL_HANDLE;
-@@ -4446,6 +4544,25 @@ namespace plume {
+@@ -4446,6 +4545,25 @@ namespace plume {
      VulkanInterface::VulkanInterface() {
  #endif
          VkResult res = volkInitialize();
@@ -223,10 +240,18 @@ index 194ed7f..8acde6d 100644
              fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
              return;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 73022bb..fb4923f 100644
+index 73022bb..9783131 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -419,6 +419,9 @@ namespace plume {
+@@ -102,6 +102,7 @@ namespace plume {
+     struct VulkanTextureView : RenderTextureView {
+         VkImageView vk = VK_NULL_HANDLE;
+         const VulkanTexture *texture = nullptr;
++        VulkanDevice *device = nullptr; // Dead Rising: kept here, the texture may be gone first (a framebuffer's depth view)
+         RenderTextureViewDesc desc;
+ 
+         VulkanTextureView(const VulkanTexture *texture, const RenderTextureViewDesc &desc);
+@@ -419,6 +420,9 @@ namespace plume {
          std::unique_ptr<RenderBuffer> nullBuffer;
          bool loadStoreOpNoneSupported = false;
          bool nullDescriptorSupported = false;

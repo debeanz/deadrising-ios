@@ -71,6 +71,16 @@ nearly every texture of the game is DXT. Build 16:
   grow when a frame needs more);
 * lists directories without throwing (an exception nothing catches ends the app on iOS).
 
+Build 16 on the iPhone: the GPU has BC formats after all; the crash report showed MoltenVK binding a
+null pipeline (plume returned an object when `vkCreateGraphicsPipelines` failed). Build 18 skips pipelines
+that could not be made and logs stderr (MoltenVK's reasons) as `[stderr]` lines. Build 18 on the
+iPhone: the Capcom logo, the title screen and sound, then a crash freeing a framebuffer whose depth
+view read its already freed texture (the renderer freed a frame's textures before its framebuffers);
+4 pipelines failed with "vertex attribute type mismatch" (UBYTE4 TEXCOORD1/2 as `R8G8B8A8_UINT` into
+the shaders' float4 inputs: desktop drivers pass the bits, MoltenVK refuses). Build 21: framebuffers
+and views are freed before textures (and plume's view keeps its device), and integer formats feeding
+float inputs are converted to float4 on the CPU like the other formats hosts cannot read.
+
 Changes go to the public repository with `scripts/ios/sync-source-repo.ps1` (copies this project's
 source into `deadrising-ios`, the same file lists as `make-source-repo.ps1`, and refuses anything
 made from the game), then commit, push and run the workflow. Tool changes go in through
@@ -154,8 +164,7 @@ status panel, log, FPS text or touch controls there (`ui/options_menu.cpp` and
   Show FPS, touch controls on / off, opacity, size, fixed / floating stick, vibration). Changes apply
   at once and are saved when it closes. Touch, the on-screen D-pad or a controller move through it.
 * **Controller button** (top centre, left of Back): hides / shows the touch controls.
-* **Four-finger tap**: the live log (the last 200 lines). It also opens by itself while the game
-  shows no picture for 3 s.
+* **Four-finger tap**: the live log (the last 200 lines; only then, never by itself).
 * **FPS counter** (Show FPS): a UIKit label in the top-left corner.
 * Leaving the app pauses rendering (no GPU work in the background); the game waits.
 
