@@ -33,6 +33,12 @@
 using Microsoft::WRL::ComPtr;
 #endif
 
+namespace plume
+{
+    uint64_t RenderPassesBegun(); // plume_vulkan.cpp (Dead Rising): render passes begun so far (Vulkan)
+    void TakeRenderPassStats(uint64_t& passes, uint64_t& loadedBytes, uint64_t& storedBytes);
+}
+
 using namespace plume;
 using namespace GuestDevice;
 
@@ -3482,12 +3488,24 @@ namespace
         DepthBuffer* depth = nullptr;
         std::unique_ptr<RenderFramebuffer> framebuffer;
         const RenderTexture* framebufferDepth = nullptr; // depth texture the framebuffer was built with
+        // Framebuffers of the top-left part of the target, for passes smaller than it (FramebufferFor), by size.
+        std::vector<std::pair<uint64_t, std::unique_ptr<RenderFramebuffer>>> sizedFramebuffers;
         uint32_t width = 0, height = 0, samples = 1;
         RenderFormat format = RenderFormat::UNKNOWN;
         RenderTextureLayout colorLayout = RenderTextureLayout::UNKNOWN;
         RenderTextureLayout singleLayout = RenderTextureLayout::UNKNOWN;
         uint32_t descriptor = 0; // single-sample image: 'color', or 'single' for MSAA
         uint32_t draws = 0;
+        // Clears that resolves asked for, made when the target is next drawn or read (ApplyClears).
+        struct PendingClear
+        {
+            RenderRect rect;
+            uint32_t flags = 0; // 0x100 colour, 0x200 depth and stencil (the resolve's flags)
+            RenderColor color;
+            float depth = 0.0f;
+            uint32_t stencil = 0;
+        };
+        std::vector<PendingClear> pendingClears;
     };
     ankerl::unordered_dense::map<uint64_t, std::unique_ptr<HostTarget>> g_targets;
     HostTarget* g_shownTarget = nullptr;
@@ -4244,6 +4262,9 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         {
             if (target.framebuffer != nullptr)
                 g_retiredFramebuffers.push_back(std::move(target.framebuffer));
+            for (auto& [size, sized] : target.sizedFramebuffers)
+                g_retiredFramebuffers.push_back(std::move(sized));
+            target.sizedFramebuffers.clear();
             RenderFramebufferDesc fb;
             const RenderTexture* color = target.color.get();
             if (color != nullptr)
@@ -4293,6 +4314,161 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         {
             list->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(target.depth->texture.get(), RenderTextureLayout::DEPTH_WRITE));
             target.depth->layout = RenderTextureLayout::DEPTH_WRITE;
+        }
+    }
+
+    // The framebuffer to draw 'width' x 'height' (host pixels) of a target. Host targets are as big as the largest
+    // pass that used their EDRAM address (the environment probes' 8x8 passes share one with full-screen ones), and a
+    // tile-based GPU (iPhone, iPad) loads and stores the whole framebuffer at every render pass: 11 MB to draw 64
+    // pixels, 30 times a frame (2026-11-25). A framebuffer of the part the pass uses (rounded up to 64 pixels) over
+    // the same textures loads and stores only that. Vulkan only (D3D12 has no render passes); DR_SIZED_FRAMEBUFFERS=0
+    // always uses the whole target.
+    RenderFramebuffer* FramebufferFor(HostTarget& target, uint32_t width, uint32_t height)
+    {
+        static const bool enabled = getenv("DR_SIZED_FRAMEBUFFERS") == nullptr || atoi(getenv("DR_SIZED_FRAMEBUFFERS")) != 0;
+        if (!enabled || !g_vulkan || target.framebuffer == nullptr)
+            return target.framebuffer.get();
+        width = std::min((std::max(width, 1u) + 63) & ~63u, target.width);
+        height = std::min((std::max(height, 1u) + 63) & ~63u, target.height);
+        if (width >= target.width && height >= target.height)
+            return target.framebuffer.get();
+        const uint64_t size = (uint64_t(width) << 32) | height;
+        for (auto& [key, framebuffer] : target.sizedFramebuffers)
+            if (key == size)
+                return framebuffer.get();
+        RenderFramebufferDesc desc;
+        const RenderTexture* color = target.color.get();
+        if (color != nullptr)
+        {
+            desc.colorAttachments = &color;
+            desc.colorAttachmentsCount = 1;
+        }
+        desc.depthAttachment = target.framebufferDepth;
+        desc.width = width;
+        desc.height = height;
+        target.sizedFramebuffers.emplace_back(size, g_device->createFramebuffer(desc));
+        return target.sizedFramebuffers.back().second.get();
+    }
+
+    // ---- Clears of resolves, made later together (2026-11-25, iPhone: GPU-bound at 1080p). The game resolves its 4X
+    // scene tile by tile and clears each tile behind it. Made at once, each strip clear began a render pass on the
+    // whole MSAA target, which a tile-based GPU (Apple) loads from memory and stores again: 6 passes, about 1.2 GB a
+    // frame at 1080p. Kept here until the target is drawn, read or the frame ends, strips with the same value that
+    // cover the target become one clear of all of it, which starts a pass without loading (plume: CLEAR load op).
+    // DR_DEFER_CLEARS=0 makes them at once, as before.
+    std::vector<HostTarget*> g_pendingClearTargets;
+
+    bool DeferClears()
+    {
+        static const bool defer = getenv("DR_DEFER_CLEARS") == nullptr || atoi(getenv("DR_DEFER_CLEARS")) != 0;
+        return defer;
+    }
+
+    bool RectsOverlap(const RenderRect& a, const RenderRect& b)
+    {
+        return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    }
+
+    // Whether full-width strips cover [0, width) x [0, height).
+    bool StripsCover(std::vector<RenderRect> rects, int32_t width, int32_t height)
+    {
+        std::sort(rects.begin(), rects.end(), [](const RenderRect& a, const RenderRect& b) { return a.top < b.top; });
+        int32_t covered = 0;
+        for (const RenderRect& r : rects)
+        {
+            if (r.left > 0 || r.right < width)
+                continue;
+            if (r.top > covered)
+                return false;
+            covered = std::max(covered, r.bottom);
+        }
+        return covered >= height;
+    }
+
+    // 'preferred': the framebuffer the next draw uses; when it holds every pending clear, they become the CLEAR load
+    // operations of that draw's render pass. Otherwise a framebuffer of the part they clear (FramebufferFor).
+    void ApplyClears(RenderCommandList* list, HostTarget& target, RenderFramebuffer* preferred = nullptr)
+    {
+        if (target.pendingClears.empty())
+            return;
+        if (target.framebuffer != nullptr)
+        {
+            int32_t right = 1, bottom = 1;
+            for (const auto& p : target.pendingClears)
+            {
+                right = std::max(right, p.rect.right);
+                bottom = std::max(bottom, p.rect.bottom);
+            }
+            RenderFramebuffer* framebuffer = preferred != nullptr && int32_t(preferred->getWidth()) >= right && int32_t(preferred->getHeight()) >= bottom
+                ? preferred : FramebufferFor(target, uint32_t(right), uint32_t(bottom));
+            TransitionForDrawing(list, target);
+            list->setFramebuffer(framebuffer);
+            const int32_t width = int32_t(framebuffer->getWidth()), height = int32_t(framebuffer->getHeight());
+            for (const uint32_t kind : { 0x100u, 0x200u })
+            {
+                if (kind == 0x100 ? target.color == nullptr : target.depth == nullptr)
+                    continue;
+                std::vector<RenderRect> rects;
+                const HostTarget::PendingClear* first = nullptr;
+                bool same = true;
+                for (const auto& p : target.pendingClears)
+                {
+                    if ((p.flags & kind) == 0)
+                        continue;
+                    if (first == nullptr)
+                        first = &p;
+                    else if (kind == 0x100 ? (p.color.r != first->color.r || p.color.g != first->color.g || p.color.b != first->color.b || p.color.a != first->color.a)
+                                           : (p.depth != first->depth || p.stencil != first->stencil))
+                        same = false;
+                    rects.push_back(p.rect);
+                }
+                if (first == nullptr)
+                    continue;
+                if (same && StripsCover(rects, width, height))
+                {
+                    if (kind == 0x100)
+                        list->clearColor(0, first->color, nullptr, 0);
+                    else
+                        list->clearDepthStencil(true, true, first->depth, first->stencil, nullptr, 0);
+                    continue;
+                }
+                for (const auto& p : target.pendingClears)
+                {
+                    if ((p.flags & kind) == 0)
+                        continue;
+                    if (kind == 0x100)
+                        list->clearColor(0, p.color, &p.rect, 1);
+                    else
+                        list->clearDepthStencil(true, true, p.depth, p.stencil, &p.rect, 1);
+                }
+            }
+        }
+        target.pendingClears.clear();
+        std::erase(g_pendingClearTargets, &target);
+    }
+
+    // Before 'target' is drawn: the clears waiting on targets that share its depth buffer (and its own).
+    void ApplyClearsFor(RenderCommandList* list, HostTarget& target, RenderFramebuffer* framebuffer)
+    {
+        for (HostTarget* other : std::vector<HostTarget*>(g_pendingClearTargets))
+            if (other != &target && target.depth != nullptr && other->depth == target.depth)
+                ApplyClears(list, *other);
+        ApplyClears(list, target, framebuffer);
+    }
+
+    // Before a region of 'target' (colour or depth) is read: the clears that touch it.
+    void ApplyClearsOverlapping(RenderCommandList* list, HostTarget& target, const RenderRect& region)
+    {
+        for (HostTarget* other : std::vector<HostTarget*>(g_pendingClearTargets))
+        {
+            if (other != &target && (target.depth == nullptr || other->depth != target.depth))
+                continue;
+            for (const auto& p : other->pendingClears)
+                if (RectsOverlap(p.rect, region))
+                {
+                    ApplyClears(list, *other);
+                    break;
+                }
         }
     }
 
@@ -4587,6 +4763,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         const int32_t x1 = std::clamp(ScaleEdge(cmd.sourceRect[2] + offsetX, scale), x0, int32_t(target.width));
         const int32_t y1 = std::clamp(ScaleEdge(cmd.sourceRect[3] + offsetY, scale), y0, int32_t(target.height));
         const bool fromDepth = (cmd.resolveFlags & 7) == 4;
+        ApplyClearsOverlapping(list, target, RenderRect(x0, y0, x1, y1)); // earlier clears of this region first
 
         // On by default (the EDRAM restore and the shadow maps read them); DR_NO_DEPTH_RESOLVE=1 skips them.
         static const bool noDepthResolves = getenv("DR_NO_DEPTH_RESOLVE") != nullptr;
@@ -4709,6 +4886,23 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         static const bool skipDepth = skipClears != nullptr && (strcmp(skipClears, "color") != 0);
         if ((cmd.resolveFlags & 0x300) != 0 && x1 > x0 && y1 > y0)
         {
+            if (DeferClears())
+            {
+                HostTarget::PendingClear clear;
+                clear.rect = RenderRect(x0, y0, x1, y1);
+                clear.flags = ((cmd.resolveFlags & 0x100) && target.color != nullptr && !skipColor ? 0x100 : 0) |
+                    ((cmd.resolveFlags & 0x200) && target.depth != nullptr && !skipDepth ? 0x200 : 0);
+                clear.color = cmd.clearColor;
+                clear.depth = cmd.clearZ;
+                clear.stencil = cmd.clearStencil;
+                if (clear.flags != 0)
+                {
+                    if (target.pendingClears.empty())
+                        g_pendingClearTargets.push_back(&target);
+                    target.pendingClears.push_back(clear);
+                }
+                return;
+            }
             TransitionForDrawing(list, target);
             list->setFramebuffer(target.framebuffer.get());
             RenderRect rect(x0, y0, x1, y1);
@@ -4865,12 +5059,18 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         if (frame.scale != lastScale)
         {
             lastScale = frame.scale;
+            for (HostTarget* waiting : g_pendingClearTargets)
+                waiting->pendingClears.clear();
+            g_pendingClearTargets.clear();
             for (auto& [key, target] : g_targets)
             {
                 if (target->color != nullptr)
                     g_retiredTextures.push_back(std::move(target->color));
                 if (target->single != nullptr)
                     g_retiredTextures.push_back(std::move(target->single));
+                for (auto& [size, sized] : target->sizedFramebuffers)
+                    g_retiredFramebuffers.push_back(std::move(sized));
+                target->sizedFramebuffers.clear();
                 if (target->framebuffer != nullptr)
                     g_retiredFramebuffers.push_back(std::move(target->framebuffer));
                 target->width = target->height = 0;
@@ -4917,10 +5117,63 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
 
         BindLayout(list);
 
+        // DR_PASS_LOG=<n>: the commands of the n-th replayed frame that began render passes (a tile-based GPU loads and
+        // stores the attachments of each; Vulkan only).
+        static const uint32_t passLogFrame = getenv("DR_PASS_LOG") != nullptr ? uint32_t(atoi(getenv("DR_PASS_LOG"))) : 0;
+        static uint32_t replayed = 0;
+        const bool passLog = passLogFrame != 0 && ++replayed == passLogFrame;
+        uint64_t passesBefore = plume::RenderPassesBegun();
+        std::string passWhat;
+        auto notePasses = [&] {
+            const uint64_t now = plume::RenderPassesBegun();
+            if (passLog && now != passesBefore && !passWhat.empty())
+            {
+                uint64_t passes = 0, loaded = 0, stored = 0;
+                plume::TakeRenderPassStats(passes, loaded, stored); // this frame's line in the log counts less
+                LOGFN("[passes] {} began {} (loads {:.1f} MB, stores {:.1f} MB)", passWhat, now - passesBefore, loaded / 1048576.0, stored / 1048576.0);
+            }
+            else if (passLog)
+            {
+                uint64_t passes = 0, loaded = 0, stored = 0;
+                plume::TakeRenderPassStats(passes, loaded, stored);
+            }
+            passesBefore = now;
+        };
         g_gpuProfile.Begin(list);
+        // The size each run of draws and clears into one target needs (the largest of its commands, host pixels),
+        // so the run keeps one framebuffer and one render pass (FramebufferFor). A resolve or an upload ends a run.
+        std::vector<std::pair<uint32_t, uint32_t>> runSizes(frame.commands.size());
+        for (size_t i = frame.commands.size(); i-- > 0;)
+        {
+            const Command& c = frame.commands[i];
+            if (c.type == Command::Upload || c.type == Command::Resolve || (c.colorKey == 0 && c.depthKey == 0))
+                continue;
+            const float scale = PassScale(c.width, c.height, frame.scale);
+            uint32_t width = uint32_t(ScaleEdge(int32_t(c.width), scale)), height = uint32_t(ScaleEdge(int32_t(c.height), scale));
+            if (i + 1 < frame.commands.size())
+            {
+                const Command& next = frame.commands[i + 1];
+                if (next.type != Command::Upload && next.type != Command::Resolve && next.colorKey == c.colorKey && next.depthKey == c.depthKey &&
+                    next.colorFormat == c.colorFormat && next.samples == c.samples)
+                {
+                    width = std::max(width, runSizes[i + 1].first);
+                    height = std::max(height, runSizes[i + 1].second);
+                }
+            }
+            runSizes[i] = { width, height };
+        }
+
         HostTarget* current = nullptr;
+        RenderFramebuffer* currentFramebuffer = nullptr;
         for (auto& cmd : frame.commands)
         {
+            if (passLog)
+            {
+                notePasses();
+                passWhat = fmt::format("#{} {} {}x{} {}x colour {:X} depth {:X}", size_t(&cmd - frame.commands.data()),
+                    cmd.type == Command::Upload ? "upload" : cmd.type == Command::Resolve ? "resolve" : cmd.type == Command::Clear ? "clear" : "draw",
+                    cmd.width, cmd.height, cmd.samples, cmd.colorKey, cmd.depthKey);
+            }
             if (cmd.type == Command::Upload)
             {
                 g_gpuProfile.Mark(list, "texture uploads");
@@ -4956,11 +5209,27 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 continue;
             }
 
-            if (&target != current || recreated)
+            // Draws and clears go through a framebuffer of their pass's size (the console clears the surface, not the EDRAM
+            // beyond it).
+            const auto [runWidth, runHeight] = runSizes[size_t(&cmd - frame.commands.data())];
+            RenderFramebuffer* framebuffer = FramebufferFor(target, std::max(runWidth, 1u), std::max(runHeight, 1u));
+            // Within a pass, a framebuffer already big enough stays (no new render pass).
+            if (&target == current && !recreated && currentFramebuffer != nullptr && framebuffer != currentFramebuffer &&
+                currentFramebuffer->getWidth() >= framebuffer->getWidth() && currentFramebuffer->getHeight() >= framebuffer->getHeight())
+                framebuffer = currentFramebuffer;
+
+            if (&target != current || recreated || framebuffer != currentFramebuffer)
             {
+                if (recreated && !target.pendingClears.empty())
+                {
+                    target.pendingClears.clear(); // new storage: the old contents are gone anyway
+                    std::erase(g_pendingClearTargets, &target);
+                }
+                ApplyClearsFor(list, target, framebuffer);
                 TransitionForDrawing(list, target);
-                list->setFramebuffer(target.framebuffer.get());
+                list->setFramebuffer(framebuffer);
                 current = &target;
+                currentFramebuffer = framebuffer;
             }
 
             if (cmd.type == Command::Clear)
@@ -5019,9 +5288,11 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             SetRootDescriptor(list, cmd.pixelConstants, 1);
             SetRootDescriptor(list, cmd.sharedConstants, 2);
 
+            const uint32_t framebufferWidth = framebuffer != nullptr ? framebuffer->getWidth() : target.width;
+            const uint32_t framebufferHeight = framebuffer != nullptr ? framebuffer->getHeight() : target.height;
             RenderViewport viewport = cmd.viewport;
             if (viewport.width <= 0.0f || viewport.height <= 0.0f)
-                viewport = RenderViewport(0.0f, 0.0f, float(target.width), float(target.height));
+                viewport = RenderViewport(0.0f, 0.0f, float(framebufferWidth), float(framebufferHeight));
             else if (passScale != 1.0f)
             {
                 viewport.x *= passScale;
@@ -5030,7 +5301,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 viewport.height *= passScale;
             }
             list->setViewports(&viewport, 1);
-            RenderRect scissor(0, 0, int32_t(target.width), int32_t(target.height));
+            RenderRect scissor(0, 0, int32_t(framebufferWidth), int32_t(framebufferHeight));
             list->setScissors(&scissor, 1);
 
             for (uint32_t n = 0; n < kMaxStreams; n++)
@@ -5074,6 +5345,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
             }();
             if (g_dumpingFrame && commandIndex >= dumpDraws.first && commandIndex <= dumpDraws.second && target.color != nullptr)
             {
+                ApplyClears(list, target);
                 QueueDump(list, SingleSampled(list, target, 0, 0, int32_t(target.width), int32_t(target.height), RenderTextureLayout::COPY_SOURCE),
                     target.format, target.width, target.height,
                     fmt::format("dump/frame{:05}_draw{:04}_{}x{}.bmp", g_frameIndex, commandIndex, target.width, target.height));
@@ -5081,6 +5353,10 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
                 current = nullptr; // back to drawing: transition and set the framebuffer again
             }
         }
+        // Clears still waiting stay for the next frame: its first pass into the target starts with them (CLEAR,
+        // nothing loaded), instead of a pass now that stores cleared pixels the next frame clears again.
+        if (passLog)
+            notePasses();
 
         // Show the colour target the frame drew into most (the scene); resolves are not followed yet.
         g_shownTarget = nullptr;
@@ -5277,6 +5553,7 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         {
             if (target->color == nullptr || target->draws == 0)
                 continue;
+            ApplyClears(list, *target);
             QueueDump(list, SingleSampled(list, *target, 0, 0, int32_t(target->width), int32_t(target->height), RenderTextureLayout::COPY_SOURCE),
                 target->format, target->width, target->height,
                 fmt::format("dump/frame{:05}_target_{:08X}_{}_{}x{}_{}draws.bmp", g_replayedFrames, uint32_t(key >> 32), uint32_t(key), target->width, target->height, target->draws));
@@ -5775,6 +6052,7 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
     }
     else if (g_shownTarget != nullptr)
     {
+        ApplyClears(list, *g_shownTarget);
         SingleSampled(list, *g_shownTarget, 0, 0, int32_t(g_shownTarget->width), int32_t(g_shownTarget->height), RenderTextureLayout::SHADER_READ);
         shownDescriptor = g_shownTarget->descriptor;
         shownWidth = g_shownTarget->width;
@@ -5838,13 +6116,31 @@ bool Renderer::Render(RenderCommandList* list, RenderFramebuffer* backBuffer, ui
         memcpy(g_uploadMemory + menuOffset, menuConstants, sizeof(menuConstants));
     }
 
-    // Keep the game's aspect ratio (16:9): black bars on wider or taller windows (phones).
+    // Where the picture goes (Config::ScreenScaling): Fit keeps the game's 16:9 with black bars on screens of another
+    // shape (phones); Fill stretches it over the whole screen; Fill 1.943:1 over a centred 1.943:1 frame (2106 x 1084:
+    // the bars sit beside an iPhone's Dynamic Island), as the user's Tunic port does.
     list->setFramebuffer(backBuffer);
     RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
     RenderRect scissor(0, 0, int32_t(width), int32_t(height));
     list->setScissors(&scissor, 1);
-    const float scale = std::min(float(width) / float(shownWidth), float(height) / float(shownHeight));
-    const float shownW = std::round(float(shownWidth) * scale), shownH = std::round(float(shownHeight) * scale);
+    const int scaling = Config::ScreenScaling.load();
+    float shownW, shownH;
+    if (scaling == 1)
+    {
+        shownW = float(width);
+        shownH = float(height);
+    }
+    else
+    {
+        const float aspect = scaling == 2 ? 2106.0f / 1084.0f : float(shownWidth) / float(shownHeight);
+        shownW = float(width);
+        shownH = std::round(float(width) / aspect);
+        if (shownH > float(height))
+        {
+            shownH = float(height);
+            shownW = std::round(float(height) * aspect);
+        }
+    }
     g_gpuProfile.Mark(list, "final blit to the window");
     if (!havePicture)
     {

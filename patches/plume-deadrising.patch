@@ -1,5 +1,5 @@
 diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
-index 6e9619d..8657c4b 100644
+index 6e9619d..adb9a1d 100644
 --- a/plume_d3d12.cpp
 +++ b/plume_d3d12.cpp
 @@ -2292,7 +2292,8 @@ namespace plume {
@@ -12,7 +12,20 @@ index 6e9619d..8657c4b 100644
          d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
          resetSamplePositions();
      }
-@@ -3052,6 +3053,7 @@ namespace plume {
+@@ -3028,7 +3029,11 @@ namespace plume {
+         psoDesc.pRootSignature = rootSignature->rootSignature;
+         psoDesc.CS.pShaderBytecode = computeShader->d3d.data();
+         psoDesc.CS.BytecodeLength = computeShader->d3d.size();
+-        device->d3d->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        const HRESULT res = device->d3d->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        if (FAILED(res)) {
++            fprintf(stderr, "CreateComputePipelineState failed with error code 0x%lX.\n", res);
++            d3d = nullptr;
++        }
+     }
+ 
+     D3D12ComputePipeline::~D3D12ComputePipeline() {
+@@ -3052,6 +3057,7 @@ namespace plume {
          assert(desc.pipelineLayout != nullptr);
  
          topology = toD3D12(desc.primitiveTopology);
@@ -20,12 +33,65 @@ index 6e9619d..8657c4b 100644
  
          const D3D12PipelineLayout *pipelineLayout = static_cast<const D3D12PipelineLayout *>(desc.pipelineLayout);
          const D3D12Shader *vertexShader = static_cast<const D3D12Shader *>(desc.vertexShader);
+@@ -3173,7 +3179,11 @@ namespace plume {
+ 
+         psoDesc.InputLayout = { inputElements.data(), UINT(inputElements.size()) };
+ 
+-        device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        const HRESULT res = device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        if (FAILED(res)) {
++            fprintf(stderr, "CreateGraphicsPipelineState failed with error code 0x%lX.\n", res);
++            d3d = nullptr;
++        }
+     }
+ 
+     D3D12GraphicsPipeline::~D3D12GraphicsPipeline() {
+@@ -3878,11 +3888,19 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderPipeline> D3D12Device::createComputePipeline(const RenderComputePipelineDesc &desc) {
+-        return std::make_unique<D3D12ComputePipeline>(this, desc);
++        // Dead Rising: nullptr when the driver could not make it (binding the empty pipeline crashed in SetPipelineState).
++        auto pipeline = std::make_unique<D3D12ComputePipeline>(this, desc);
++        if (pipeline->d3d == nullptr)
++            return nullptr;
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> D3D12Device::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
+-        return std::make_unique<D3D12GraphicsPipeline>(this, desc);
++        // Dead Rising: nullptr when the driver could not make it (binding the empty pipeline crashed in SetPipelineState).
++        auto pipeline = std::make_unique<D3D12GraphicsPipeline>(this, desc);
++        if (pipeline->d3d == nullptr)
++            return nullptr;
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> D3D12Device::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index ec756d3..82f8f6c 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -1601,6 +1601,10 @@ namespace plume {
+         const RenderTexture *depthAttachment = nullptr;
+         const RenderTextureView *depthAttachmentView = nullptr;
+         bool depthAttachmentReadOnly = false;
++        // Dead Rising (Vulkan): a framebuffer smaller than its attachments (0: their size). A tile-based GPU loads and
++        // stores only that much at each render pass.
++        uint32_t width = 0;
++        uint32_t height = 0;
+ 
+         RenderFramebufferDesc() = default;
+ 
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 194ed7f..56fed0f 100644
+index 194ed7f..59f9b6e 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -13,6 +13,9 @@
+@@ -11,8 +11,12 @@
+ #include "plume_vulkan.h"
+ 
  #include <algorithm>
++#include <atomic>
  #include <cmath>
  #include <climits>
 +#include <filesystem>
@@ -34,7 +100,7 @@ index 194ed7f..56fed0f 100644
  #include <unordered_map>
  
  #if DLSS_ENABLED
-@@ -28,6 +31,39 @@
+@@ -28,6 +32,39 @@
  // - Fix resource pools.
  
  namespace plume {
@@ -74,7 +140,7 @@ index 194ed7f..56fed0f 100644
      // Backend constants.
  
      // Required buffer alignment for acceleration structures.
-@@ -1076,6 +1112,7 @@ namespace plume {
+@@ -1076,6 +1113,7 @@ namespace plume {
          assert(desc.arrayIndex < texture->desc.arraySize);
  
          this->texture = texture;
@@ -82,7 +148,7 @@ index 194ed7f..56fed0f 100644
          this->desc = desc;
  
          const uint32_t mipLevels = std::min(desc.mipLevels, texture->desc.mipLevels - desc.mipSlice);
-@@ -1105,7 +1142,7 @@ namespace plume {
+@@ -1105,7 +1143,7 @@ namespace plume {
  
      VulkanTextureView::~VulkanTextureView() {
          if (vk != VK_NULL_HANDLE) {
@@ -91,7 +157,7 @@ index 194ed7f..56fed0f 100644
          }
      }
  
-@@ -1387,7 +1424,7 @@ namespace plume {
+@@ -1387,7 +1425,7 @@ namespace plume {
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.stage = stageInfo;
  
@@ -100,7 +166,7 @@ index 194ed7f..56fed0f 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
              return;
-@@ -1646,7 +1683,7 @@ namespace plume {
+@@ -1646,7 +1684,7 @@ namespace plume {
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
  
@@ -109,7 +175,175 @@ index 194ed7f..56fed0f 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
              return;
-@@ -3202,6 +3239,8 @@ namespace plume {
+@@ -2593,6 +2631,14 @@ namespace plume {
+             attachments.emplace_back(attachment);
+         }
+ 
++        if (desc.width != 0 && desc.width < width) {
++            width = desc.width;
++        }
++
++        if (desc.height != 0 && desc.height < height) {
++            height = desc.height;
++        }
++
+         VkSubpassDescription subpass = {};
+         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+         subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
+@@ -2614,6 +2660,11 @@ namespace plume {
+             fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
+             return;
+         }
++
++        // Dead Rising: kept for the CLEAR variants (getRenderPass).
++        attachmentDescs = attachments;
++        this->colorReferences = colorReferences;
++        this->depthReference = depthReference;
+         
+         VkFramebufferCreateInfo fbInfo = {};
+         fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+@@ -2632,6 +2683,12 @@ namespace plume {
+     }
+ 
+     VulkanFramebuffer::~VulkanFramebuffer() {
++        for (VkRenderPass pass : clearPasses) {
++            if (pass != VK_NULL_HANDLE) {
++                vkDestroyRenderPass(device->vk, pass, nullptr);
++            }
++        }
++
+         if (vk != VK_NULL_HANDLE) {
+             vkDestroyFramebuffer(device->vk, vk, nullptr);
+         }
+@@ -2641,6 +2698,53 @@ namespace plume {
+         }
+     }
+ 
++    VkRenderPass VulkanFramebuffer::getRenderPass(uint32_t clearMask) const {
++        clearMask &= 7;
++        if (clearMask == 0 || depthAttachmentReadOnly || renderPass == VK_NULL_HANDLE) {
++            return renderPass;
++        }
++
++        if (clearPasses[clearMask] != VK_NULL_HANDLE) {
++            return clearPasses[clearMask];
++        }
++
++        std::vector<VkAttachmentDescription> attachments = attachmentDescs;
++        if ((clearMask & 1) && !colorAttachments.empty()) {
++            attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++        }
++
++        if (depthAttachment != nullptr && !attachments.empty()) {
++            if (clearMask & 2) {
++                attachments.back().loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++
++            if (clearMask & 4) {
++                attachments.back().stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++        }
++
++        VkSubpassDescription subpass = {};
++        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++        subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
++        subpass.colorAttachmentCount = uint32_t(colorReferences.size());
++        if (depthAttachment != nullptr) {
++            subpass.pDepthStencilAttachment = &depthReference;
++        }
++
++        VkRenderPassCreateInfo passInfo = {};
++        passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++        passInfo.pAttachments = attachments.data();
++        passInfo.attachmentCount = uint32_t(attachments.size());
++        passInfo.pSubpasses = &subpass;
++        passInfo.subpassCount = 1;
++        if (vkCreateRenderPass(device->vk, &passInfo, nullptr, &clearPasses[clearMask]) != VK_SUCCESS) {
++            clearPasses[clearMask] = VK_NULL_HANDLE;
++            return renderPass;
++        }
++
++        return clearPasses[clearMask];
++    }
++
+     uint32_t VulkanFramebuffer::getWidth() const {
+         return width;
+     }
+@@ -3081,6 +3185,12 @@ namespace plume {
+     }
+ 
+     void VulkanCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
++        // Dead Rising: the same framebuffer again keeps its render pass. A new pass makes a tile-based GPU (iPhone, iPad)
++        // store all attachments and load them again: after every resolve that clears, the game's next draw did that.
++        if (framebuffer != nullptr && framebuffer == targetFramebuffer) {
++            return;
++        }
++
+         endActiveRenderPass();
+ 
+         if (framebuffer != nullptr) {
+@@ -3123,11 +3233,40 @@ namespace plume {
+         }
+     }
+ 
++    bool VulkanCommandList::coversFramebuffer(const RenderRect *clearRects, uint32_t clearRectsCount) const {
++        if (targetFramebuffer == nullptr) {
++            return false;
++        }
++
++        if (clearRectsCount == 0) {
++            return true;
++        }
++
++        for (uint32_t i = 0; i < clearRectsCount; i++) {
++            const RenderRect &r = clearRects[i];
++            if (r.left <= 0 && r.top <= 0 && r.right >= int32_t(targetFramebuffer->width) && r.bottom >= int32_t(targetFramebuffer->height)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
+     void VulkanCommandList::clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
+         assert(targetFramebuffer != nullptr);
+         assert(attachmentIndex < targetFramebuffer->colorAttachments.size());
+         assert((clearRectsCount == 0) || (clearRects != nullptr));
+ 
++        if (activeRenderPass == VK_NULL_HANDLE && attachmentIndex == 0 && coversFramebuffer(clearRects, clearRectsCount)) {
++            auto &pending = pendingColor.color.float32;
++            pending[0] = colorValue.r;
++            pending[1] = colorValue.g;
++            pending[2] = colorValue.b;
++            pending[3] = colorValue.a;
++            pendingClearMask |= 1;
++            return;
++        }
++
+         checkActiveRenderPass();
+ 
+         thread_local std::vector<VkClearRect> rectVector;
+@@ -3148,6 +3287,19 @@ namespace plume {
+         assert(targetFramebuffer != nullptr);
+         assert((clearRectsCount == 0) || (clearRects != nullptr));
+ 
++        if (activeRenderPass == VK_NULL_HANDLE && targetFramebuffer->depthAttachment != nullptr && !targetFramebuffer->depthAttachmentReadOnly &&
++            coversFramebuffer(clearRects, clearRectsCount)) {
++            if (clearDepth) {
++                pendingDepthStencil.depthStencil.depth = depthValue;
++                pendingClearMask |= 2;
++            }
++            if (clearStencil) {
++                pendingDepthStencil.depthStencil.stencil = stencilValue;
++                pendingClearMask |= 4;
++            }
++            return;
++        }
++
+         checkActiveRenderPass();
+ 
+         thread_local std::vector<VkClearRect> rectVector;
+@@ -3202,6 +3354,8 @@ namespace plume {
              imageCopy.bufferRowLength = ((srcLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
              imageCopy.bufferImageHeight = ((srcLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
              imageCopy.imageSubresource.aspectMask = toAspectFlags(dstTexture->desc.format, dstTexture->desc.flags);
@@ -118,7 +352,7 @@ index 194ed7f..56fed0f 100644
              imageCopy.imageSubresource.baseArrayLayer = dstLocation.subresource.arrayIndex;
              imageCopy.imageSubresource.layerCount = 1;
              imageCopy.imageSubresource.mipLevel = dstLocation.subresource.mipLevel;
-@@ -3213,6 +3252,32 @@ namespace plume {
+@@ -3213,6 +3367,32 @@ namespace plume {
              imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
              vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
          }
@@ -151,7 +385,106 @@ index 194ed7f..56fed0f 100644
          else {
              VkImageCopy imageCopy = {};
              imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
-@@ -4137,6 +4202,27 @@ namespace plume {
+@@ -3450,22 +3630,96 @@ namespace plume {
+         vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
+     }
+ 
++    // Dead Rising: render passes begun and the bytes their attachments hold (TakeRenderPassStats).
++    static std::atomic<uint64_t> g_renderPassCount{ 0 }, g_renderPassBytes{ 0 }, g_renderPassLoadBytes{ 0 };
++
++    void TakeRenderPassStats(uint64_t &passes, uint64_t &loadedBytes, uint64_t &storedBytes) {
++        passes = g_renderPassCount.exchange(0, std::memory_order_relaxed);
++        loadedBytes = g_renderPassLoadBytes.exchange(0, std::memory_order_relaxed);
++        storedBytes = g_renderPassBytes.exchange(0, std::memory_order_relaxed);
++    }
++
++    static std::atomic<uint64_t> g_renderPassTotal{ 0 };
++    uint64_t RenderPassesBegun() {
++        return g_renderPassTotal.load(std::memory_order_relaxed);
++    }
++
+     void VulkanCommandList::checkActiveRenderPass() {
+         assert(targetFramebuffer != nullptr);
+         
+         if (activeRenderPass == VK_NULL_HANDLE) {
++            // Dead Rising: what a tile-based GPU (Apple) loads at the start of the pass (not what it clears) and stores at its end.
++            uint64_t stored = 0, loaded = 0;
++            for (size_t i = 0; i < targetFramebuffer->colorAttachments.size(); i++) {
++                const VulkanTexture *texture = targetFramebuffer->colorAttachments[i];
++                const uint64_t bytes = uint64_t(targetFramebuffer->width) * targetFramebuffer->height * RenderFormatSize(texture->desc.format) * std::max(1u, uint32_t(texture->desc.multisampling.sampleCount));
++                stored += bytes;
++                loaded += (i == 0 && (pendingClearMask & 1)) ? 0 : bytes;
++            }
++            if (targetFramebuffer->depthAttachment != nullptr) {
++                const uint64_t bytes = uint64_t(targetFramebuffer->width) * targetFramebuffer->height *
++                    RenderFormatSize(targetFramebuffer->depthAttachment->desc.format) * std::max(1u, uint32_t(targetFramebuffer->depthAttachment->desc.multisampling.sampleCount));
++                stored += bytes;
++                loaded += (pendingClearMask & 2) ? 0 : bytes;
++            }
++            g_renderPassCount.fetch_add(1, std::memory_order_relaxed);
++            g_renderPassTotal.fetch_add(1, std::memory_order_relaxed);
++            g_renderPassBytes.fetch_add(stored, std::memory_order_relaxed);
++            g_renderPassLoadBytes.fetch_add(loaded, std::memory_order_relaxed);
++            // Pending full clears (clearColor, clearDepthStencil) become the pass's CLEAR load operations.
++            const uint32_t clearMask = pendingClearMask;
++            pendingClearMask = 0;
++            const VkRenderPass pass = targetFramebuffer->getRenderPass(clearMask);
++            VkClearValue clearValues[9] = {};
++            const uint32_t colorCount = uint32_t(targetFramebuffer->colorAttachments.size());
++            if (colorCount > 0) {
++                clearValues[0] = pendingColor;
++            }
++            const uint32_t clearValueCount = colorCount + (targetFramebuffer->depthAttachment != nullptr ? 1 : 0);
++            if (targetFramebuffer->depthAttachment != nullptr && colorCount < 9) {
++                clearValues[colorCount] = pendingDepthStencil;
++            }
++
+             VkRenderPassBeginInfo beginInfo = {};
+             beginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+-            beginInfo.renderPass = targetFramebuffer->renderPass;
++            beginInfo.renderPass = pass;
+             beginInfo.framebuffer = targetFramebuffer->vk;
+             beginInfo.renderArea.extent.width = targetFramebuffer->width;
+             beginInfo.renderArea.extent.height = targetFramebuffer->height;
++            beginInfo.clearValueCount = clearMask != 0 ? std::min(clearValueCount, 9u) : 0;
++            beginInfo.pClearValues = clearMask != 0 ? clearValues : nullptr;
+             vkCmdBeginRenderPass(vk, &beginInfo, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
+-            activeRenderPass = targetFramebuffer->renderPass;
++            activeRenderPass = pass;
++
++            // No CLEAR variant (it could not be made): clear inside the pass instead.
++            if (clearMask != 0 && pass == targetFramebuffer->renderPass) {
++                VkClearRect rect = {};
++                rect.rect.extent.width = targetFramebuffer->width;
++                rect.rect.extent.height = targetFramebuffer->height;
++                rect.layerCount = 1;
++                if ((clearMask & 1) && colorCount > 0) {
++                    VkClearAttachment attachment = {};
++                    attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++                    attachment.colorAttachment = 0;
++                    attachment.clearValue = pendingColor;
++                    vkCmdClearAttachments(vk, 1, &attachment, 1, &rect);
++                }
++                if (clearMask & 6) {
++                    VkClearAttachment attachment = {};
++                    attachment.aspectMask = ((clearMask & 2) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | ((clearMask & 4) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
++                    attachment.clearValue = pendingDepthStencil;
++                    vkCmdClearAttachments(vk, 1, &attachment, 1, &rect);
++                }
++            }
+         }
+     }
+ 
+     void VulkanCommandList::endActiveRenderPass() {
++        if (activeRenderPass == VK_NULL_HANDLE && pendingClearMask != 0 && targetFramebuffer != nullptr) {
++            checkActiveRenderPass(); // a pass that only clears
++        }
++
++        pendingClearMask = 0;
+         if (activeRenderPass != VK_NULL_HANDLE) {
+             vkCmdEndRenderPass(vk);
+             activeRenderPass = VK_NULL_HANDLE;
+@@ -4137,6 +4391,27 @@ namespace plume {
          if (!nullDescriptorSupported) {
              nullBuffer = createBuffer(RenderBufferDesc::DefaultBuffer(16, RenderBufferFlag::VERTEX));
          }
@@ -179,7 +512,7 @@ index 194ed7f..56fed0f 100644
      }
  
      VulkanDevice::~VulkanDevice() {
-@@ -4156,11 +4242,19 @@ namespace plume {
+@@ -4156,11 +4431,19 @@ namespace plume {
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createComputePipeline(const RenderComputePipelineDesc &desc) {
@@ -201,7 +534,7 @@ index 194ed7f..56fed0f 100644
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
-@@ -4418,6 +4512,11 @@ namespace plume {
+@@ -4418,6 +4701,11 @@ namespace plume {
              allocator = VK_NULL_HANDLE;
          }
  
@@ -213,7 +546,7 @@ index 194ed7f..56fed0f 100644
          if (vk != VK_NULL_HANDLE) {
              vkDestroyDevice(vk, nullptr);
              vk = VK_NULL_HANDLE;
-@@ -4446,6 +4545,25 @@ namespace plume {
+@@ -4446,6 +4734,25 @@ namespace plume {
      VulkanInterface::VulkanInterface() {
  #endif
          VkResult res = volkInitialize();
@@ -240,7 +573,7 @@ index 194ed7f..56fed0f 100644
              fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
              return;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 73022bb..9783131 100644
+index 73022bb..319b59c 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -102,6 +102,7 @@ namespace plume {
@@ -251,7 +584,34 @@ index 73022bb..9783131 100644
          RenderTextureViewDesc desc;
  
          VulkanTextureView(const VulkanTexture *texture, const RenderTextureViewDesc &desc);
-@@ -419,6 +420,9 @@ namespace plume {
+@@ -276,6 +277,14 @@ namespace plume {
+         uint32_t width = 0;
+         uint32_t height = 0;
+ 
++        // Dead Rising: the same pass with CLEAR instead of LOAD (bit 0: colour attachment 0, 1: depth, 2: stencil), made
++        // when first used. A tile-based GPU then starts the pass without reading the attachments from memory.
++        std::vector<VkAttachmentDescription> attachmentDescs;
++        std::vector<VkAttachmentReference> colorReferences;
++        VkAttachmentReference depthReference = {};
++        mutable VkRenderPass clearPasses[8] = {};
++        VkRenderPass getRenderPass(uint32_t clearMask) const;
++
+         VulkanFramebuffer(VulkanDevice *device, const RenderFramebufferDesc &desc);
+         ~VulkanFramebuffer() override;
+         uint32_t getWidth() const override;
+@@ -304,6 +313,11 @@ namespace plume {
+         const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
+         const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
+         VkRenderPass activeRenderPass = VK_NULL_HANDLE;
++        // Dead Rising: full clears made while no pass is active wait for the pass and become its CLEAR load operations.
++        uint32_t pendingClearMask = 0;
++        VkClearValue pendingColor = {};
++        VkClearValue pendingDepthStencil = {};
++        bool coversFramebuffer(const RenderRect *clearRects, uint32_t clearRectsCount) const;
+ 
+         VulkanCommandList(VulkanCommandQueue *queue);
+         ~VulkanCommandList() override;
+@@ -419,6 +433,9 @@ namespace plume {
          std::unique_ptr<RenderBuffer> nullBuffer;
          bool loadStoreOpNoneSupported = false;
          bool nullDescriptorSupported = false;

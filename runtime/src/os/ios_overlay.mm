@@ -686,12 +686,12 @@ static NSArray<NSString*>* DRPercent(int from, int to, int step)
 static NSInteger DRResolutionIndex()
 {
     const float s = Config::ResolutionScale;
-    return s >= 2.75f ? 3 : s >= 1.75f ? 2 : s >= 1.25f ? 1 : 0;
+    return s >= 1.75f ? 2 : s >= 1.25f ? 1 : 0;
 }
-static void DRSetResolution(NSInteger i) /* the options menu's choices: 720p, 1080p, 1440p, 2160p */
+static void DRSetResolution(NSInteger i) /* 720p, 1080p, 1440p (no 2160p on iPhone / iPad: Config::kMaxResolutionScale) */
 {
-    static const float scales[] = { 1.0f, 1.5f, 2.0f, 3.0f };
-    Config::ResolutionScale = scales[MAX(0, MIN(3, i))];
+    static const float scales[] = { 1.0f, 1.5f, 2.0f };
+    Config::ResolutionScale = scales[MAX(0, MIN(2, i))];
 }
 
 @implementation DRPanel {
@@ -766,7 +766,8 @@ static void DRSetResolution(NSInteger i) /* the options menu's choices: 720p, 10
     NSArray* offOn = @[ @"Off", @"On" ];
     _rows = @[
         [self row:@"Frame Rate" values:@[ @"30 FPS (console)", @"60 FPS" ] get:^{ return (NSInteger)(Config::FrameRate == 60); } set:^(NSInteger i) { Config::FrameRate = i == 1 ? 60 : 30; }],
-        [self row:@"Resolution" values:@[ @"720p (console)", @"1080p", @"1440p", @"2160p" ] get:^{ return DRResolutionIndex(); } set:^(NSInteger i) { DRSetResolution(i); }],
+        [self row:@"Resolution" values:@[ @"720p (console)", @"1080p", @"1440p" ] get:^{ return DRResolutionIndex(); } set:^(NSInteger i) { DRSetResolution(i); }],
+        [self row:@"Screen Scaling" values:@[ @"Fit", @"Fill", @"Fill 1.943:1" ] get:^{ return (NSInteger)Config::ScreenScaling.load(); } set:^(NSInteger i) { Config::ScreenScaling = int(MAX(0, MIN(2, i))); }],
         [self row:@"Anti-Aliasing" values:@[ @"Off", @"4X MSAA" ] get:^{ return (NSInteger)Config::MSAA.load(); } set:^(NSInteger i) { Config::MSAA = i == 1; }],
         [self row:@"FXAA" values:offOn get:^{ return (NSInteger)Config::FXAA.load(); } set:^(NSInteger i) { Config::FXAA = i == 1; }],
         [self row:@"Motion Blur" values:offOn get:^{ return (NSInteger)Config::MotionBlur.load(); } set:^(NSInteger i) { Config::MotionBlur = i == 1; }],

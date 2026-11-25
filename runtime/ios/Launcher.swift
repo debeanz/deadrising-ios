@@ -57,6 +57,7 @@ private final class LauncherModel: ObservableObject {
     @Published var motionBlur: Bool
     @Published var vsync: Bool
     @Published var showFps: Bool
+    @Published var screenScaling: Int
     @Published var starting = false
     let onPlay: (NSDictionary) -> Void
 
@@ -64,12 +65,13 @@ private final class LauncherModel: ObservableObject {
         self.documents = documents
         self.files = GameFiles.scan(documents: documents)
         self.frameRate = (settings["frameRate"] as? NSNumber)?.intValue ?? 30
-        self.resolutionScale = (settings["resolutionScale"] as? NSNumber)?.doubleValue ?? 1.0
+        self.resolutionScale = min((settings["resolutionScale"] as? NSNumber)?.doubleValue ?? 1.0, 2.0) // 2160p was too much for phones
         self.msaa = (settings["msaa"] as? NSNumber)?.boolValue ?? true
         self.fxaa = (settings["fxaa"] as? NSNumber)?.boolValue ?? true
         self.motionBlur = (settings["motionBlur"] as? NSNumber)?.boolValue ?? true
         self.vsync = (settings["vsync"] as? NSNumber)?.boolValue ?? true
         self.showFps = (settings["showFps"] as? NSNumber)?.boolValue ?? false
+        self.screenScaling = max(0, min(2, (settings["screenScaling"] as? NSNumber)?.intValue ?? 0))
         self.onPlay = onPlay
     }
 
@@ -84,6 +86,7 @@ private final class LauncherModel: ObservableObject {
             "motionBlur": NSNumber(value: motionBlur),
             "vsync": NSNumber(value: vsync),
             "showFps": NSNumber(value: showFps),
+            "screenScaling": NSNumber(value: screenScaling),
             "gameFolder": files.folder as NSString,
         ]
         return values as NSDictionary
@@ -132,14 +135,20 @@ private struct LauncherView: View {
 
     private var resolutionLabel: String {
         let s = model.resolutionScale
-        return s >= 2.75 ? "2160p" : s >= 1.75 ? "1440p" : s >= 1.25 ? "1080p" : "720p"
+        return s >= 1.75 ? "1440p" : s >= 1.25 ? "1080p" : "720p"
     }
     private var resolutionNote: String {
         let s = model.resolutionScale
-        if s >= 2.75 { return "Three times the console's 720p. Only for the newest iPads and iPhones." }
         if s >= 1.75 { return "Twice the console's 720p: sharp, and hard work for the GPU." }
         if s >= 1.25 { return "1.5 times the console's 720p." }
         return "The console's own 720p: the fastest."
+    }
+    private var scalingNote: String {
+        switch model.screenScaling {
+        case 1: return "The 16:9 picture stretched over the whole screen."
+        case 2: return "The 16:9 picture stretched to 1.943:1: black bars beside the Dynamic Island."
+        default: return "The game's own 16:9 shape: black bars at the sides."
+        }
     }
     private var logURL: URL { URL(fileURLWithPath: model.documents + "/DRRecomp.log") }
 
@@ -171,6 +180,7 @@ private struct LauncherView: View {
         .onChange(of: model.motionBlur) { _ in tick() }
         .onChange(of: model.vsync) { _ in tick() }
         .onChange(of: model.showFps) { _ in tick() }
+        .onChange(of: model.screenScaling) { _ in tick() }
     }
 
     // MARK: title page
@@ -236,7 +246,13 @@ private struct LauncherView: View {
                 section(1, "Display") {
                     row("Resolution", note: resolutionNote) {
                         Picker("Resolution", selection: $model.resolutionScale) {
-                            Text("720p").tag(1.0); Text("1080p").tag(1.5); Text("1440p").tag(2.0); Text("2160p").tag(3.0)
+                            Text("720p").tag(1.0); Text("1080p").tag(1.5); Text("1440p").tag(2.0)
+                        }
+                        .pickerStyle(.segmented).frame(width: 200)
+                    }
+                    row("Screen scaling", note: scalingNote) {
+                        Picker("Screen scaling", selection: $model.screenScaling) {
+                            Text("Fit").tag(0); Text("Fill").tag(1); Text("Fill 1.943:1").tag(2)
                         }
                         .pickerStyle(.segmented).frame(width: 250)
                     }
@@ -366,7 +382,7 @@ private final class LauncherHostingController: UIHostingController<LauncherView>
 }
 
 @objc(DRLauncher) public final class DRLauncher: NSObject {
-    /// settings: frameRate, resolutionScale, msaa, fxaa, motionBlur, vsync, showFps (NSNumber); documents: the app's
+    /// settings: frameRate, resolutionScale, msaa, fxaa, motionBlur, vsync, showFps, screenScaling (NSNumber); documents: the app's
     /// Documents folder. onPlay gets the same keys back, plus gameFolder (NSString).
     @objc public static func make(settings: NSDictionary, documents: NSString, onPlay: @escaping (NSDictionary) -> Void) -> UIViewController {
         let seg = UISegmentedControl.appearance()

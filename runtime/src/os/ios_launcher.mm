@@ -4,6 +4,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,6 +27,7 @@ bool Launcher::Run(const std::filesystem::path& documents, std::filesystem::path
         @"motionBlur": @(Config::MotionBlur.load()),
         @"vsync": @(Config::VSync.load()),
         @"showFps": @(Config::ShowFps.load()),
+        @"screenScaling": @(Config::ScreenScaling.load()),
     };
     NSString* documentsPath = [NSString stringWithUTF8String:(const char*)documents.u8string().c_str()];
 
@@ -53,12 +55,13 @@ bool Launcher::Run(const std::filesystem::path& documents, std::filesystem::path
     }
 
     Config::FrameRate = [chosen[@"frameRate"] intValue] >= 60 ? 60 : 30;
-    Config::ResolutionScale = float([chosen[@"resolutionScale"] doubleValue]);
+    Config::ResolutionScale = std::min(float([chosen[@"resolutionScale"] doubleValue]), Config::kMaxResolutionScale);
     Config::MSAA = [chosen[@"msaa"] boolValue];
     Config::FXAA = [chosen[@"fxaa"] boolValue];
     Config::MotionBlur = [chosen[@"motionBlur"] boolValue];
     Config::VSync = [chosen[@"vsync"] boolValue];
     Config::ShowFps = [chosen[@"showFps"] boolValue];
+    Config::ScreenScaling = std::max(0, std::min(2, [chosen[@"screenScaling"] intValue]));
     if (NSString* folder = chosen[@"gameFolder"])
         gamePath = std::filesystem::path([folder UTF8String]);
     Config::Save();

@@ -145,6 +145,51 @@ builds: Actions → iOS IPA → Run workflow.
    **Files → On My iPhone → Dead Rising → game**.
 3. Start the app. The log (`DRRecomp.log`) and saves are in the same Dead Rising folder.
 
+## Performance on iPhone and iPad (render passes)
+
+Build 21 on an iPhone 15 (2026-11-25): GPU-bound, 9 fps at 2160p and about 27 fps at 1080p, the video
+thread waiting 20-30 ms a frame for the GPU. Apple GPUs render in tiles: every render pass loads its
+attachments from memory at the start and stores them at the end. A PC GPU pays nothing like it, which is
+why the PC ran the same frames at 60 fps. Measured on the PC under Vulkan with what a tile GPU would
+move (the `[video]` line every 5 s: "render passes N a frame (a tile-based GPU loads X MB and stores Y
+MB)"; `DR_PASS_LOG=<n>` lists the commands of the n-th frame that began passes):
+
+| 1080p, 4X MSAA | passes | loaded | stored |
+|-|-|-|-|
+| title, before | 103 | 1683 MB | 1683 MB |
+| title, build 22 | 75 | 333 MB | 621 MB |
+| Security Room, before | 80 | 1375 MB | 1562 MB |
+| Security Room, build 22 | 82 | 459 MB | 636 MB |
+
+What build 22 changed (pictures compared with the old path on the title and in the Security Room:
+the same):
+
+* plume (Vulkan): setting the same framebuffer again keeps its render pass (each resolve that cleared
+  was followed by a second pass for the next draw);
+* plume (Vulkan): full clears made while no pass is active become the next pass's CLEAR load
+  operations (render pass variants per framebuffer), so the pass loads nothing;
+* the renderer keeps the clears that resolves ask for (the game clears each 4X tile behind its
+  resolve) until the target is drawn or read, even into the next frame, and makes strips with the same
+  value that cover the target one clear (`DR_DEFER_CLEARS=0`: at once, as before);
+* passes smaller than their host target (the environment probes' 8x8 to 128x128 faces share one with
+  full-screen passes) draw through a framebuffer of their size over the same textures
+  (`DR_SIZED_FRAMEBUFFERS=0`: always the whole target; plume `RenderFramebufferDesc::width/height`);
+* 2160p is gone on iPhone and iPad (`Config::kMaxResolutionScale`); 720p moves about half of 1080p.
+
+With these, 4X MSAA costs little (1080p: 459 / 636 MB with it, a little less without). Still to look
+at: the CPU side (the draw hooks take 7-17 ms a frame on the phone).
+
+## Screen scaling and widescreen
+
+Screen Scaling (start screen and Settings; `ScreenScaling` in recomp_config.toml): Fit (the game's
+16:9 with black bars), Fill (stretched over the whole screen), Fill 1.943:1 (stretched over a centred
+2106 x 1084 frame, the bars beside the Dynamic Island), as in the user's Tunic port.
+
+Real widescreen (a wider view, not a stretched picture) is not done yet: the 3D camera, its frustum
+culling and the HUD layout all assume 16:9 and need patching in the game code. The only 16:9 constant
+in the image (0x82021BC8) belongs to a video-mode helper (`sub_82572B48`: pixel aspect from the display
+information), not the camera.
+
 ## Controls and everything that is not the game
 
 On iPhone and iPad everything that is not the game is UIKit and Core Animation on the main thread
@@ -153,14 +198,14 @@ frames; the game renders on a thread of its own (`gpu/video.cpp`). The renderer 
 status panel, log, FPS text or touch controls there (`ui/options_menu.cpp` and
 `hid/touch_controls.cpp` are PC only).
 
-* **Start screen** (`runtime/ios/Launcher.swift`, SwiftUI): resolution, frame rate, MSAA, FXAA,
+* **Start screen** (`runtime/ios/Launcher.swift`, SwiftUI): resolution (720p-1440p), screen scaling, frame rate, MSAA, FXAA,
   motion blur, V-Sync, Show FPS; warns when the game files are missing.
 * **Touch controls**: the mobile kit's layout on a 1080-high canvas in the safe area. Left stick
   bottom left (optionally floating), D-pad above it, right stick and L3 / R3, A / B / X / Y bottom
   right in the Xbox colours, LB / LT top left, RB / RT top right, Back / Start top centre; haptics.
   Hidden while a controller (Xbox, PlayStation, MFi) is connected.
 * **Gear** (top centre, right of Start), **three-finger tap**, **Start + Back** on a controller or
-  **F1**: the Settings panel (frame rate, resolution, anti-aliasing, FXAA, motion blur, V-Sync,
+  **F1**: the Settings panel (frame rate, resolution, screen scaling, anti-aliasing, FXAA, motion blur, V-Sync,
   Show FPS, touch controls on / off, opacity, size, fixed / floating stick, vibration). Changes apply
   at once and are saved when it closes. Touch, the on-screen D-pad or a controller move through it.
 * **Controller button** (top centre, left of Back): hides / shows the touch controls.

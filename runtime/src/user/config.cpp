@@ -68,9 +68,11 @@ void Config::Load()
         else if (key == "MotionBlur")
             MotionBlur = ParseBool(value, MotionBlur);
         else if (key == "ResolutionScale")
-            ResolutionScale = std::clamp(std::round(float(atof(value.c_str())) * 2.0f) / 2.0f, 1.0f, 3.0f);
+            ResolutionScale = std::clamp(std::round(float(atof(value.c_str())) * 2.0f) / 2.0f, 1.0f, kMaxResolutionScale);
         else if (key == "ShowFps")
             ShowFps = ParseBool(value, ShowFps);
+        else if (key == "ScreenScaling")
+            ScreenScaling = std::clamp(atoi(value.c_str()), 0, 2);
     }
     // Test windows: DR_SETTINGS="FrameRate=30;MotionBlur=true;..." overrides settings for this run
     // only, and DR_NO_SAVE=1 (implied by DR_SETTINGS) keeps the menu from writing the player's file.
@@ -94,13 +96,14 @@ void Config::Load()
             else if (key == "MSAA") MSAA = ParseBool(value, MSAA);
             else if (key == "FXAA") FXAA = ParseBool(value, FXAA);
             else if (key == "MotionBlur") MotionBlur = ParseBool(value, MotionBlur);
-            else if (key == "ResolutionScale") ResolutionScale = std::clamp(std::round(float(atof(value.c_str())) * 2.0f) / 2.0f, 1.0f, 3.0f);
+            else if (key == "ResolutionScale") ResolutionScale = std::clamp(std::round(float(atof(value.c_str())) * 2.0f) / 2.0f, 1.0f, kMaxResolutionScale);
             else if (key == "ShowFps") ShowFps = ParseBool(value, ShowFps);
+            else if (key == "ScreenScaling") ScreenScaling = std::clamp(atoi(value.c_str()), 0, 2);
         }
         LOGFN("[config] DR_SETTINGS overrides: {} (not saved)", overrides);
     }
-    LOGFN("[config] loaded: {} fps, vsync {}, fullscreen {}, MSAA {}, FXAA {}, motion blur {}, resolution scale {}, show fps {}",
-        FrameRate.load(), VSync.load(), Fullscreen.load(), MSAA.load(), FXAA.load(), MotionBlur.load(), ResolutionScale.load(), ShowFps.load());
+    LOGFN("[config] loaded: {} fps, vsync {}, fullscreen {}, MSAA {}, FXAA {}, motion blur {}, resolution scale {}, show fps {}, screen scaling {}",
+        FrameRate.load(), VSync.load(), Fullscreen.load(), MSAA.load(), FXAA.load(), MotionBlur.load(), ResolutionScale.load(), ShowFps.load(), ScreenScaling.load());
 }
 
 void Config::Save()
@@ -120,7 +123,8 @@ void Config::Save()
         << "FXAA = " << (FXAA ? "true" : "false") << "                # smoothing filter on the final image\n"
         << "MotionBlur = " << (MotionBlur ? "true" : "false") << "\n"
         << "ResolutionScale = " << ResolutionScale.load() << "     # internal resolution: 1 = 720p (the console's), 1.5 = 1080p, 2 = 1440p, 3 = 2160p\n"
-        << "ShowFps = " << (ShowFps ? "true" : "false") << "            # frame counter in the top-left corner\n";
+        << "ShowFps = " << (ShowFps ? "true" : "false") << "            # frame counter in the top-left corner\n"
+        << "ScreenScaling = " << ScreenScaling.load() << "         # 0 fit (black bars), 1 fill (stretched), 2 fill 1.943:1 (bars beside the Dynamic Island)\n";
     std::ofstream file(Path(), std::ios::binary | std::ios::trunc);
     file << out.str();
     if (!file)

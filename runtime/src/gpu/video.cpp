@@ -36,6 +36,8 @@ namespace plume
     // plume_vulkan.cpp (Dead Rising): the Vulkan pipeline cache on disk.
     void SetVulkanPipelineCachePath(const std::string& path);
     bool SaveVulkanPipelineCache(RenderDevice* device);
+    // plume_vulkan.cpp (Dead Rising): render passes begun since the last call and the bytes of their attachments.
+    void TakeRenderPassStats(uint64_t& passes, uint64_t& loadedBytes, uint64_t& storedBytes);
 }
 
 using namespace plume;
@@ -344,8 +346,19 @@ namespace
         lastSave = std::chrono::steady_clock::now();
     }
 
-    void UpdateTitle(const Video::FrameStats& stats, double fps)
+    void UpdateTitle(const Video::FrameStats& stats, double fps, uint32_t frames)
     {
+        // Vulkan: render passes a frame and what their attachments hold. A tile-based GPU (iPhone, iPad) loads all of
+        // it at the start of each pass and stores it at the end; a PC GPU does not.
+        static double passesPerFrame = 0.0, loadedPerFrame = 0.0, storedPerFrame = 0.0;
+        uint64_t passes = 0, loaded = 0, stored = 0;
+        TakeRenderPassStats(passes, loaded, stored);
+        if (frames != 0 && passes != 0)
+        {
+            passesPerFrame = double(passes) / frames;
+            loadedPerFrame = double(loaded) / (1024.0 * 1024.0) / frames;
+            storedPerFrame = double(stored) / (1024.0 * 1024.0) / frames;
+        }
         char title[256];
         snprintf(title, sizeof(title),
             "Dead Rising (recompiled) [%s] - frame %u, %.0f fps | draws %u, vertex batches %u, clears %u, resolves %u, tiles %u, textures %u",
@@ -356,7 +369,8 @@ namespace
 
         static uint32_t updates;
         if (updates++ % 10 == 0) // every ~5 s
-            LOGFN("[video] {}; [memory] {}", title, MemoryInfo::Describe());
+            LOGFN("[video] {}; [memory] {}{}", title, MemoryInfo::Describe(), passesPerFrame == 0.0 ? std::string() :
+                fmt::format("; render passes {:.0f} a frame (a tile-based GPU loads {:.0f} MB and stores {:.0f} MB)", passesPerFrame, loadedPerFrame, storedPerFrame));
     }
 
     // iPhone / iPad: the main thread keeps UIKit, SDL's events and the controllers (and with them the native
@@ -563,7 +577,7 @@ namespace
         if (elapsed >= 0.5)
         {
             const double fps = framesSinceTitle / elapsed;
-            UpdateTitle(stats, fps);
+            UpdateTitle(stats, fps, framesSinceTitle);
             g_fps.store(fps, std::memory_order_relaxed);
             OptionsMenu::SetFps(fps);
             Shaders::Update();
