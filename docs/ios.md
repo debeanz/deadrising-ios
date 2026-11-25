@@ -6,10 +6,27 @@ game's Direct3D on the phone's GPU. On iOS the renderer uses Vulkan through **Mo
 Metal), the same Vulkan path that runs on Windows with `DR_GPU=vulkan`, so the SPIR-V shader cache
 is shared.
 
-Status: **prepared, not built yet.** The Windows build runs the game to the prologue on both D3D12
-and Vulkan; the iOS-specific code (memory, window, MoltenVK loading, main thread, paths) is written
-but has never been compiled for iOS. The first GitHub Actions run will show what still needs
-fixing.
+Status: **built, not yet run on a device** (2026-11-25, GitHub Actions run 10: `DeadRising-10.ipa`,
+13.7 MB: the 39.5 MB arm64 executable and MoltenVK 1.4.2; release `ios-10` of the private
+repository). What the first runs needed:
+
+* MoltenVK v1.2.11 has no release files: v1.4.2.
+* XenosRecomp crashed on macOS (status 139): one vertex shader exports to register 63 (point size /
+  edge flag / kill vertex), which has no interpolator; the translator read `interpolators.end()`
+  (an empty name on Windows by luck, garbage with libc++). Such exports are now dropped (on
+  Windows that shader had been writing its value into `oTexCoord1.x`). Found by translating every
+  shader with an AddressSanitizer build on Windows. The Mac run translates on one thread
+  (`XENOS_THREADS`) and prints a stack trace if it faults.
+* FFmpeg's libraries: `find_library(... NO_CMAKE_FIND_ROOT_PATH)` (CMake looked inside the iOS SDK).
+* Objective-C enabled at the top level on Apple (plume_apple.mm, SDL).
+* The log macros with no arguments (`LOGFN("text")`): `__VA_OPT__(,)` (clang-cl dropped the comma,
+  Apple clang does not); `ERROR_INVALID_PARAMETER` defined outside Windows.
+
+Changes go to the public repository with `scripts/ios/sync-source-repo.ps1` (copies this project's
+source into `deadrising-ios`, the same file lists as `make-source-repo.ps1`, and refuses anything
+made from the game), then commit, push and run the workflow. Tool changes go in through
+`patches/`: regenerate a patch with `git -C tools/<tool> diff --ignore-cr-at-eol` (LF line ends)
+and check it applies to a clean checkout of the pinned commit.
 
 ## How the build works (GitHub Actions, like lm-ios)
 
@@ -67,6 +84,6 @@ Windows, `DR_TOUCH=1` turns them on with the mouse as a finger (`DR_TOUCH=2`: al
 
 ## Known limits
 
-* Never compiled for iOS yet (see Status).
+* Not yet run on a device (see Status); no app icon yet.
 * Needs an iPhone or iPad with an A14 chip or newer (Metal 3: buffer device addresses and
   descriptor indexing, which the shaders use through MoltenVK).
