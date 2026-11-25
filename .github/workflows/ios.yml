@@ -140,7 +140,8 @@ jobs:
           cp "$GITHUB_WORKSPACE/runtime/ios/DeadRising.entitlements" out/
           # The executable's symbols, sorted by address: names the offsets in "[crash]" lines. Private
           # (the recompiled functions are named after the game's addresses), so only into the release.
-          nm -n "$app/DeadRising" 2>/dev/null | gzip -9 > "out/DeadRising-${{ github.run_number }}.symbols.gz" || true
+          nm -n "$GITHUB_WORKSPACE/$app/DeadRising" 2>/dev/null | gzip -9 > "out/DeadRising-${{ github.run_number }}.symbols.gz" || true
+          echo "symbols: $(gzip -dc "out/DeadRising-${{ github.run_number }}.symbols.gz" | wc -l) lines"
           ls -lh out
 
       - name: Deliver to the private data repository
