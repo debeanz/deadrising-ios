@@ -21,7 +21,17 @@ namespace TextureDecode
             R10G10B10A2, // -> RGBA16 unorm
             DXT3A,       // 4-bit alpha blocks -> R8
             CTX1,        // two-channel blocks -> RG8
+            // GPUs without BC formats (most iPhones): decoded here (SetSoftwareBlockCompression).
+            BC1,         // -> RGBA8
+            BC2,         // -> RGBA8
+            BC3,         // -> RGBA8
+            BC4,         // -> R8
+            BC4S,        // -> R8 signed
+            BC5,         // -> RG8
+            BC5S,        // -> RG8 signed
         };
+
+        std::atomic<bool> g_softwareBC{ false };
 
         struct Format
         {
@@ -36,6 +46,19 @@ namespace TextureDecode
 
         Format Lookup(uint32_t format)
         {
+            if (g_softwareBC.load(std::memory_order_relaxed))
+                switch (format)
+                {
+                case 18:
+                case 51: return { RenderFormat::R8G8B8A8_UNORM, RenderFormat::UNKNOWN, 4, 8, Convert::BC1, 1, 4 };   // k_DXT1
+                case 19:
+                case 52: return { RenderFormat::R8G8B8A8_UNORM, RenderFormat::UNKNOWN, 4, 16, Convert::BC2, 1, 4 };  // k_DXT2_3
+                case 20:
+                case 53: return { RenderFormat::R8G8B8A8_UNORM, RenderFormat::UNKNOWN, 4, 16, Convert::BC3, 1, 4 };  // k_DXT4_5
+                case 49: return { RenderFormat::R8G8_UNORM, RenderFormat::R8G8_SNORM, 4, 16, Convert::BC5, 1, 2 };   // k_DXN
+                case 59: return { RenderFormat::R8_UNORM, RenderFormat::R8_SNORM, 4, 8, Convert::BC4, 1, 1 };        // k_DXT5A
+                default: break;
+                }
             switch (format)
             {
             case 2:  return { RenderFormat::R8_UNORM, RenderFormat::R8_SNORM, 1, 1, Convert::Copy, 1, 1 };            // k_8
@@ -126,11 +149,121 @@ namespace TextureDecode
             return uint8_t((value * 255 + ((1u << bits) - 1) / 2) / ((1u << bits) - 1));
         }
 
+        // ---- BC (DXT) blocks on the CPU, as D3D defines them (the blocks are little-endian after SwapEndian).
+
+        // The four colours of a BC1-3 colour block as RGBA8; BC1 with c0 <= c1 has three and transparent black.
+        void ColourPalette(const uint8_t* block, bool bc1, uint8_t palette[4][4])
+        {
+            const uint16_t c0 = uint16_t(block[0] | (block[1] << 8)), c1 = uint16_t(block[2] | (block[3] << 8));
+            const auto unpack = [](uint16_t c, uint8_t* out) {
+                out[0] = Expand(c >> 11, 5);
+                out[1] = Expand((c >> 5) & 63, 6);
+                out[2] = Expand(c & 31, 5);
+                out[3] = 255;
+            };
+            unpack(c0, palette[0]);
+            unpack(c1, palette[1]);
+            if (!bc1 || c0 > c1)
+                for (int i = 0; i < 3; i++)
+                {
+                    palette[2][i] = uint8_t((2 * palette[0][i] + palette[1][i] + 1) / 3);
+                    palette[3][i] = uint8_t((palette[0][i] + 2 * palette[1][i] + 1) / 3);
+                }
+            else
+                for (int i = 0; i < 3; i++)
+                {
+                    palette[2][i] = uint8_t((palette[0][i] + palette[1][i] + 1) / 2);
+                    palette[3][i] = 0;
+                }
+            palette[2][3] = 255;
+            palette[3][3] = (!bc1 || c0 > c1) ? 255 : 0;
+        }
+
+        void DecodeColourBlock(const uint8_t* block, bool bc1, uint8_t* dst, uint32_t dstPitch, uint32_t texelsX, uint32_t texelsY)
+        {
+            uint8_t palette[4][4];
+            ColourPalette(block, bc1, palette);
+            const uint32_t indices = uint32_t(block[4] | (block[5] << 8) | (block[6] << 16) | (uint32_t(block[7]) << 24));
+            for (uint32_t y = 0; y < texelsY; y++)
+                for (uint32_t x = 0; x < texelsX; x++)
+                    memcpy(dst + y * dstPitch + x * 4, palette[(indices >> (2 * (y * 4 + x))) & 3], 4);
+        }
+
+        // A BC4 block (also BC3's alpha, BC5's channels): 16 values, one byte each, every 'stride' bytes.
+        void DecodeValueBlock(const uint8_t* block, bool isSigned, uint8_t* dst, uint32_t dstPitch, uint32_t stride, uint32_t texelsX, uint32_t texelsY)
+        {
+            int values[8];
+            if (!isSigned)
+            {
+                const int a0 = block[0], a1 = block[1];
+                values[0] = a0;
+                values[1] = a1;
+                if (a0 > a1)
+                    for (int i = 1; i < 7; i++)
+                        values[i + 1] = ((7 - i) * a0 + i * a1 + 3) / 7;
+                else
+                {
+                    for (int i = 1; i < 5; i++)
+                        values[i + 1] = ((5 - i) * a0 + i * a1 + 2) / 5;
+                    values[6] = 0;
+                    values[7] = 255;
+                }
+            }
+            else
+            {
+                const int a0 = std::max<int>(int8_t(block[0]), -127), a1 = std::max<int>(int8_t(block[1]), -127);
+                values[0] = a0;
+                values[1] = a1;
+                if (a0 > a1)
+                    for (int i = 1; i < 7; i++)
+                        values[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+                else
+                {
+                    for (int i = 1; i < 5; i++)
+                        values[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+                    values[6] = -127;
+                    values[7] = 127;
+                }
+            }
+            uint64_t bits = 0;
+            for (int i = 0; i < 6; i++)
+                bits |= uint64_t(block[2 + i]) << (8 * i);
+            for (uint32_t y = 0; y < texelsY; y++)
+                for (uint32_t x = 0; x < texelsX; x++)
+                    dst[y * dstPitch + x * stride] = uint8_t(values[(bits >> (3 * (y * 4 + x))) & 7]);
+        }
+
         // Converts one guest block (after endian swap) into host texels at dst (host row pitch given).
         void ConvertBlock(const Format& f, const uint8_t* src, uint8_t* dst, uint32_t dstPitch, uint32_t texelsX, uint32_t texelsY)
         {
             switch (f.convert)
             {
+            case Convert::BC1:
+                DecodeColourBlock(src, true, dst, dstPitch, texelsX, texelsY);
+                break;
+            case Convert::BC2:
+            {
+                DecodeColourBlock(src + 8, false, dst, dstPitch, texelsX, texelsY);
+                uint64_t bits;
+                memcpy(&bits, src, 8);
+                for (uint32_t y = 0; y < texelsY; y++)
+                    for (uint32_t x = 0; x < texelsX; x++)
+                        dst[y * dstPitch + x * 4 + 3] = uint8_t(((bits >> (4 * (y * 4 + x))) & 15) * 17);
+                break;
+            }
+            case Convert::BC3:
+                DecodeColourBlock(src + 8, false, dst, dstPitch, texelsX, texelsY);
+                DecodeValueBlock(src, false, dst + 3, dstPitch, 4, texelsX, texelsY);
+                break;
+            case Convert::BC4:
+            case Convert::BC4S:
+                DecodeValueBlock(src, f.convert == Convert::BC4S, dst, dstPitch, 1, texelsX, texelsY);
+                break;
+            case Convert::BC5:
+            case Convert::BC5S:
+                DecodeValueBlock(src, f.convert == Convert::BC5S, dst, dstPitch, 2, texelsX, texelsY);
+                DecodeValueBlock(src + 8, f.convert == Convert::BC5S, dst + 1, dstPitch, 2, texelsX, texelsY);
+                break;
             case Convert::Copy:
                 memcpy(dst, src, f.bytesPerBlock);
                 break;
@@ -511,7 +644,7 @@ namespace TextureDecode
         if (mips == nullptr)
             layout.levels = 1;
 
-        const Format& f = layout.format;
+        Format f = layout.format;
 
         // Signed formats (normal maps): every component the format has is signed.
         bool allSigned = true;
@@ -519,12 +652,24 @@ namespace TextureDecode
             if (((fetch.Signs() >> (c * 2)) & 3) != 1)
                 allSigned = false;
         out.format = (allSigned && f.hostSigned != RenderFormat::UNKNOWN) ? f.hostSigned : f.host;
+        if (out.format == f.hostSigned && f.convert == Convert::BC4)
+            f.convert = Convert::BC4S;
+        else if (out.format == f.hostSigned && f.convert == Convert::BC5)
+            f.convert = Convert::BC5S;
 
-        out.width = fetch.Width();
-        out.height = fetch.Dimension() == 0 ? 1 : fetch.Height();
+        // BC decoded on the CPU takes 4-8 times the memory (the title's textures: 71 MB as BC, 389 MB as RGBA8),
+        // too much for an iPhone: large 2D textures with mip levels start at their second level there (a quarter
+        // of the memory; on a phone screen at 720p the first level is rarely seen). DR_SOFTWARE_BC_FULL=1 keeps it.
+        static const bool keepFullBC = getenv("DR_SOFTWARE_BC_FULL") != nullptr && atoi(getenv("DR_SOFTWARE_BC_FULL")) != 0;
+        const bool softwareBC = f.convert >= Convert::BC1 && f.convert <= Convert::BC5S;
+        const uint32_t baseWidth = fetch.Width(), baseHeight = fetch.Dimension() == 0 ? 1 : fetch.Height();
+        const uint32_t skip = (softwareBC && !keepFullBC && fetch.Dimension() == 1 && layout.levels >= 2 && std::max(baseWidth, baseHeight) >= 512) ? 1 : 0;
+
+        out.width = std::max(baseWidth >> skip, 1u);
+        out.height = std::max(baseHeight >> skip, 1u);
         out.layers = layout.layers;
         out.cube = layout.layers == 6;
-        out.levels = layout.levels;
+        out.levels = layout.levels - skip;
 
         // Host layout: level after level, each with its layers; rows 256-byte, levels and layers
         // 512-byte aligned (upload footprints).
@@ -589,18 +734,21 @@ namespace TextureDecode
             }
         };
 
-        // Base level: at the start of its surface, or at its place in the packed tile.
-        uint32_t x0 = 0, y0 = 0;
-        if (layout.packedLevel == 0)
-            PackedMipOffset(out.width, out.height, f.blockWidth, 0, x0, y0);
-        decodeLevel(0, source, layout.pitchBlocks, layout.sliceSize, layout.layerStride, x0, y0);
-
-        for (uint32_t l = 1; l < out.levels; l++)
+        for (uint32_t l = 0; l < out.levels; l++)
         {
-            const MipSurface surface = GetMipSurface(fetch, layout, l);
-            x0 = y0 = 0;
-            if (l >= layout.packedLevel)
-                PackedMipOffset(out.width, out.height, f.blockWidth, l, x0, y0);
+            const uint32_t guestLevel = l + skip;
+            uint32_t x0 = 0, y0 = 0;
+            if (guestLevel == 0)
+            {
+                // Base level: at the start of its surface, or at its place in the packed tile.
+                if (layout.packedLevel == 0)
+                    PackedMipOffset(baseWidth, baseHeight, f.blockWidth, 0, x0, y0);
+                decodeLevel(l, source, layout.pitchBlocks, layout.sliceSize, layout.layerStride, x0, y0);
+                continue;
+            }
+            const MipSurface surface = GetMipSurface(fetch, layout, guestLevel);
+            if (guestLevel >= layout.packedLevel)
+                PackedMipOffset(baseWidth, baseHeight, f.blockWidth, guestLevel, x0, y0);
             decodeLevel(l, mips + surface.offset, surface.pitchBlocks, surface.sliceSize, surface.stride, x0, y0);
         }
 
@@ -657,5 +805,18 @@ namespace TextureDecode
             return TiledOffset(x, y, pitch, log2Bpb);
         }
         return (y * pitch + x) * bytesPerTexel;
+    }
+}
+
+namespace TextureDecode
+{
+    void SetSoftwareBlockCompression(bool software)
+    {
+        g_softwareBC.store(software);
+    }
+
+    bool SoftwareBlockCompression()
+    {
+        return g_softwareBC.load();
     }
 }

@@ -13,3 +13,10 @@ namespace Overlay
     void Create(SDL_Window* window); // main thread, once the window exists
     void ToggleSettings();           // main thread: Start + Back on a controller, or F1 (ui/options_menu.cpp)
 }
+
+namespace IosGpu
+{
+    // Whether the GPU can sample the BC (DXT) formats (Metal's supportsBCTextureCompression: Macs and iPads
+    // with an M chip; iPhones mostly not). Without them the textures are decoded on the CPU (gpu/texture_decode.h).
+    bool SupportsBCTextures();
+}

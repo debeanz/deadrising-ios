@@ -18,6 +18,7 @@
 #include <hid/touch_controls.h>
 #include <os/logger.h>
 #include <os/hang_watchdog.h>
+#include <os/memory_info.h>
 #include <profiler/cpu_sampler.h>
 
 #include <cfloat>
@@ -671,7 +672,14 @@ namespace
     // being copied into every frame's data: 108 MB a frame in the mall at 4K, copied twice on the
     // CPU and read by the GPU from upload memory. A region is freed when its data changes or its
     // entry is evicted, and reused only after the frames that drew from it have finished.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // iPhone / iPad: GPU memory is the app's own memory there, and the system ends an app that goes over its
+    // limit (2026-11-25: the iPhone build ended at frame 8, when the first 768 MB buffer was made). What does
+    // not fit stays in each frame's data, as before.
+    constexpr uint64_t kGeometryHeapSize = 192ull << 20;
+#else
     constexpr uint64_t kGeometryHeapSize = 768ull << 20;
+#endif
     constexpr uint32_t kResidentAfter = 8;
 
     struct GeometryHeap
@@ -1027,6 +1035,7 @@ namespace
 
         void Run()
         {
+            HangWatchdog::PrepareThread(); // crash reports, also of a stack overflow
             while (true)
             {
                 DecodeJob* job;
@@ -3414,7 +3423,8 @@ namespace
             CreateUploadSlot(slot, std::max<size_t>(needed * 3 / 2, 16 << 20));
             static uint32_t logged;
             if (logged++ < 50)
-                LOGFN("[renderer] upload buffer of slot {} grown to {} MB in game (frame data {} MB)", g_frameSlot, slot.size >> 20, needed >> 20);
+                LOGFN("[renderer] upload buffer of slot {} grown to {} MB in game (frame data {} MB); [memory] {}", g_frameSlot, slot.size >> 20,
+                    needed >> 20, MemoryInfo::Describe());
         }
         g_uploadBuffer = slot.buffer.get();
         g_uploadMemory = slot.memory;
@@ -4810,7 +4820,10 @@ float4 mainMenuPS(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Tar
         if (!frame.geometryUploads.empty())
         {
             if (g_geometryBuffer == nullptr)
+            {
                 g_geometryBuffer = g_device->createBuffer(RenderBufferDesc::DefaultBuffer(kGeometryHeapSize, RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX));
+                LOGFN("[memory] geometry buffer made ({} MB): {}", kGeometryHeapSize >> 20, MemoryInfo::Describe());
+            }
             list->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(g_geometryBuffer.get(), RenderBufferAccess::WRITE));
             for (const GeometryUpload& upload : frame.geometryUploads)
                 list->copyBufferRegion(g_geometryBuffer->at(upload.destination), g_uploadBuffer->at(upload.source), upload.size);
@@ -5551,7 +5564,12 @@ bool Renderer::Init(RenderDevice* device, bool vulkan, RenderFormat backBufferFo
     // DR_UPLOAD_MB sets the size (0: start at 16 MB and grow in game, as before).
     {
         const char* value = getenv("DR_UPLOAD_MB");
-        const size_t mb = value != nullptr ? size_t(std::max(0, atoi(value))) : 160;
+        #if defined(__APPLE__) && TARGET_OS_IPHONE
+        constexpr size_t kDefaultMB = 48; // the app's own memory on iOS (kGeometryHeapSize); grows when a frame needs more
+#else
+        constexpr size_t kDefaultMB = 160;
+#endif
+        const size_t mb = value != nullptr ? size_t(std::max(0, atoi(value))) : kDefaultMB;
         if (mb >= 16)
         {
             const auto start = std::chrono::steady_clock::now();

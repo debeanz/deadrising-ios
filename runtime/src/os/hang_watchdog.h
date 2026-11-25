@@ -13,5 +13,8 @@ namespace HangWatchdog
     void Start();                                   // once, before the game starts
     void OnPresent();                               // the renderer presented a frame
     void RegisterGuestThread(const char* name);     // on each guest thread as it starts
+    // Apple: a stack of its own for crash reports on this thread (RegisterGuestThread does it for game
+    // threads); Start installs the crash handler ("[crash]" lines, DR_CRASH_HANDLER=0 off).
+    void PrepareThread();
     void NoteImport(const char* name, uint32_t lr); // every import call (kernel/imports_dr.cpp)
 }

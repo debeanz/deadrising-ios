@@ -44,3 +44,20 @@ std::vector<std::string> os::logger::RecentLines(size_t count)
         lines.push_back(g_recent[i % kRecentLines]);
     return lines;
 }
+
+void os::logger::LogCrash(const std::string_view str)
+{
+    // From a crash handler: the thread that crashed may hold the log's lock, so wait for it only briefly
+    // and write anyway.
+    std::unique_lock lock(g_logMutex, std::defer_lock);
+    for (int attempt = 0; attempt < 100 && !lock.try_lock(); attempt++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const std::string line = fmt::format("[error] {}\n", str);
+    fputs(line.c_str(), stdout);
+    fflush(stdout);
+    if (g_logFile)
+    {
+        fputs(line.c_str(), g_logFile);
+        fflush(g_logFile);
+    }
+}

@@ -65,4 +65,5 @@ namespace os::logger
     void Log(const std::string_view str, ELogType type = ELogType::None, const char* func = nullptr);
     // The last lines logged (up to 300), oldest first: the status panel (ui/options_menu.cpp), the iOS live log.
     std::vector<std::string> RecentLines(size_t count);
+    void LogCrash(const std::string_view str); // from a crash handler: does not wait long for the lock
 }

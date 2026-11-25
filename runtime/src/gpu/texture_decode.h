@@ -82,6 +82,14 @@ namespace TextureDecode
 
 namespace TextureDecode
 {
+    // GPUs without the BC (DXT) formats (most iPhones; DR_SOFTWARE_BC=1 to test on a PC): DXT1-5, DXN and DXT5A
+    // are decoded here to RGBA8, RG8 and R8 instead. Before the first Decode.
+    void SetSoftwareBlockCompression(bool software);
+    bool SoftwareBlockCompression();
+}
+
+namespace TextureDecode
+{
     // Byte offset of texel (x, y) of the base level of an uncompressed texture in guest memory
     // (tiled or linear), for writing resolved data back where the CPU expects it.
     uint32_t TexelOffset(const FetchConstant& fetch, uint32_t x, uint32_t y, uint32_t bytesPerTexel);

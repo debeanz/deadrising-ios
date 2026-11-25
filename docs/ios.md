@@ -45,6 +45,32 @@ black): what is happening and the last 36 log lines; `DR_TEST_STALL=<frame>:<sec
 game to test it. Stack names in `[watchdog]` lines are approximate (the nearest recompiled
 function by host address); the guest `lr` values are exact.
 
+Build 13 on the iPhone: still black, the same thread asleep in `RtlEnterCriticalSection` with the
+lock free. The cause was `compare_exchange_weak`, which on ARM may fail without another owner (it
+can on load-linked / store-conditional); the code then slept waiting for an owner that did not
+exist. Build 15 uses `compare_exchange_strong` there and in the events, semaphores and
+`RtlTryEnterCriticalSection`, and retries when the lock turns out free. Build 15 also moves
+everything that is not the game to UIKit (below) and renders on a thread of its own.
+
+Build 15 on the iPhone: past the freeze (start screen, native overlay, the logos' first frames),
+then the app ended at guest frame 8-16 with nothing in the log, right as the first texture decode
+started. Most iPhone GPUs have no BC (DXT) formats (Metal's `supportsBCTextureCompression`), and
+nearly every texture of the game is DXT. Build 16:
+
+* decodes DXT1-5, DXN and DXT5A on the CPU when the GPU lacks BC (`gpu/texture_decode.cpp`, to
+  RGBA8 / RG8 / R8; `DR_SOFTWARE_BC=1` does it on a PC for testing; checked against the GPU path on
+  the title screen). That costs memory (title: 71 MB as BC, 389 MB as RGBA8), so large 2D textures
+  with mip levels start at their second level there (127 MB; `DR_SOFTWARE_BC_FULL=1` keeps them);
+* has a crash handler on Apple platforms (`os/hang_watchdog.cpp`): `[crash]` lines with the signal,
+  address, thread, its last import and the stack (recompiled functions as `sub_`, the rest as
+  symbol and executable offset; `DeadRising-N.symbols.gz` in the release names the offsets),
+  uncaught C++ exceptions with their message; `DR_CRASH_HANDLER=0` off;
+* logs memory (`[memory]`: the footprint and what iOS leaves before it ends the app, every 5 s,
+  when big buffers are made, on iOS memory warnings and below 600 MB left);
+* makes the resident geometry buffer 192 MB (768 on a PC) and the upload buffers 48 MB (they
+  grow when a frame needs more);
+* lists directories without throwing (an exception nothing catches ends the app on iOS).
+
 Changes go to the public repository with `scripts/ios/sync-source-repo.ps1` (copies this project's
 source into `deadrising-ios`, the same file lists as `make-source-repo.ps1`, and refuses anything
 made from the game), then commit, push and run the workflow. Tool changes go in through
@@ -96,14 +122,34 @@ builds: Actions → iOS IPA → Run workflow.
    **Files → On My iPhone → Dead Rising → game**.
 3. Start the app. The log (`DRRecomp.log`) and saves are in the same Dead Rising folder.
 
-## Controls
+## Controls and everything that is not the game
 
-On-screen touch controls (`runtime/src/hid/touch_controls.cpp`, drawn by the renderer over the
-game; screenshot `docs/images/touch_controls.png`): left stick bottom left, D-pad next to it,
-A / B / X / Y bottom right in the Xbox colours, LB / LT top left, RB / RT top right, Back / Start
-top centre; dragging anywhere else on the right half turns the camera. They hide while a game
-controller (Xbox, PlayStation, MFi) is connected and come back when the screen is touched. On
-Windows, `DR_TOUCH=1` turns them on with the mouse as a finger (`DR_TOUCH=2`: always shown).
+On iPhone and iPad everything that is not the game is UIKit and Core Animation on the main thread
+(`runtime/src/os/ios_overlay.mm`, after the user's Tunic port), so it never waits for the game's
+frames; the game renders on a thread of its own (`gpu/video.cpp`). The renderer draws no menu,
+status panel, log, FPS text or touch controls there (`ui/options_menu.cpp` and
+`hid/touch_controls.cpp` are PC only).
+
+* **Start screen** (`runtime/ios/Launcher.swift`, SwiftUI): resolution, frame rate, MSAA, FXAA,
+  motion blur, V-Sync, Show FPS; warns when the game files are missing.
+* **Touch controls**: the mobile kit's layout on a 1080-high canvas in the safe area. Left stick
+  bottom left (optionally floating), D-pad above it, right stick and L3 / R3, A / B / X / Y bottom
+  right in the Xbox colours, LB / LT top left, RB / RT top right, Back / Start top centre; haptics.
+  Hidden while a controller (Xbox, PlayStation, MFi) is connected.
+* **Gear** (top centre, right of Start), **three-finger tap**, **Start + Back** on a controller or
+  **F1**: the Settings panel (frame rate, resolution, anti-aliasing, FXAA, motion blur, V-Sync,
+  Show FPS, touch controls on / off, opacity, size, fixed / floating stick, vibration). Changes apply
+  at once and are saved when it closes. Touch, the on-screen D-pad or a controller move through it.
+* **Controller button** (top centre, left of Back): hides / shows the touch controls.
+* **Four-finger tap**: the live log (the last 200 lines). It also opens by itself while the game
+  shows no picture for 3 s.
+* **FPS counter** (Show FPS): a UIKit label in the top-left corner.
+* Leaving the app pauses rendering (no GPU work in the background); the game waits.
+
+Touch settings use the Tunic port's `NSUserDefaults` keys (`PortTouchControls`,
+`PortTouchOpacity`, `PortTouchSize`, `PortFloatingStick`, `PortHaptics`). On Windows,
+`DR_TOUCH=1` still turns on the old renderer-drawn controls with the mouse as a finger
+(`DR_TOUCH=2`: always shown).
 
 ## Known limits
 

@@ -5,12 +5,14 @@
 #include "video.h"
 #include "shaders.h"
 #include "renderer.h"
+#include "texture_decode.h"
 #include <hid/input.h>
 #include <ui/options_menu.h>
 #include <user/config.h>
 #include <os/logger.h>
 #include <profiler/cpu_sampler.h>
 #include <os/hang_watchdog.h>
+#include <os/memory_info.h>
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -354,7 +356,7 @@ namespace
 
         static uint32_t updates;
         if (updates++ % 10 == 0) // every ~5 s
-            LOGFN("[video] {}", title);
+            LOGFN("[video] {}; [memory] {}", title, MemoryInfo::Describe());
     }
 
     // iPhone / iPad: the main thread keeps UIKit, SDL's events and the controllers (and with them the native
@@ -401,6 +403,17 @@ namespace
         }
 
         LOGFN("[video] window and {} device ready", g_host.apiName);
+
+        // BC (DXT) textures: most iPhone GPUs cannot sample them (2026-11-25: the iPhone build ended when the
+        // first one was made), so they are decoded on the CPU there. DR_SOFTWARE_BC=1 does it anywhere (tests).
+        bool softwareBC = getenv("DR_SOFTWARE_BC") != nullptr && atoi(getenv("DR_SOFTWARE_BC")) != 0;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        if (!IosGpu::SupportsBCTextures())
+            softwareBC = true;
+#endif
+        TextureDecode::SetSoftwareBlockCompression(softwareBC);
+        LOGFN("[video] BC (DXT) textures: {}", softwareBC ? "decoded on the CPU (the GPU has no BC formats, or DR_SOFTWARE_BC=1)" : "sampled by the GPU");
+
         Input::Init();
         return true;
     }
@@ -612,6 +625,7 @@ namespace
     void* RenderThreadMain(void*)
     {
         pthread_setname_np("render");
+        HangWatchdog::PrepareThread(); // crash reports, also of a stack overflow
         InitRenderer();
         g_initOk = true;
         g_initDone = true;

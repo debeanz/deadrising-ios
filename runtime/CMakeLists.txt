@@ -136,6 +136,7 @@ set(DR_RUNTIME_SOURCES
     src/ui/options_menu.cpp
     src/profiler/cpu_sampler.cpp
     src/os/hang_watchdog.cpp
+    src/os/memory_info.cpp
 )
 list(APPEND DR_RUNTIME_SOURCES src/os/logger_win32.cpp) # stdio: portable despite the name
 
@@ -213,7 +214,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     find_library(DR_UIKIT UIKit REQUIRED)
     find_library(DR_SWIFTUI SwiftUI REQUIRED)
     find_library(DR_QUARTZCORE QuartzCore REQUIRED)
-    target_link_libraries(DRRecomp PRIVATE ${DR_UIKIT} ${DR_SWIFTUI} ${DR_QUARTZCORE})
+    find_library(DR_METAL Metal REQUIRED)
+    target_link_libraries(DRRecomp PRIVATE ${DR_UIKIT} ${DR_SWIFTUI} ${DR_QUARTZCORE} ${DR_METAL})
     if (DR_MOLTENVK_FRAMEWORK)
         add_custom_command(TARGET DRRecomp POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:DRRecomp>/Frameworks"

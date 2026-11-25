@@ -1167,11 +1167,12 @@ static uint32_t NtQueryDirectoryFile_Impl(uint32_t fileHandle, uint32_t eventHan
         dir->entries.clear();
         dir->entryIndex = 0;
         std::error_code ec;
-        for (auto& entry : std::filesystem::directory_iterator(dir->path, ec))
+        // increment(ec), not a range-for: that throws on an error, and nothing catches it (on iOS the app just ends).
+        for (auto it = std::filesystem::directory_iterator(dir->path, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
         {
-            auto name = entry.path().filename().u8string();
+            auto name = it->path().filename().u8string();
             if (MatchMask((const char*)name.c_str(), mask))
-                dir->entries.push_back(entry);
+                dir->entries.push_back(*it);
         }
         dir->scanStarted = true;
     }

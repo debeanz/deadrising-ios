@@ -5,9 +5,13 @@
 #include <cpu/ppc_context.h>
 #include <os/logger.h>
 #include <gpu/video.h>
+#include <kernel/memory.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 #include <pthread.h>
 #endif
 
@@ -127,11 +131,167 @@ namespace
         }
     }
 
-    void Thread()
+    void LoadFunctions()
     {
+        if (!g_functions.empty())
+            return;
         for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
             g_functions.emplace_back(uintptr_t(PPCFuncMappings[i].host), uint32_t(PPCFuncMappings[i].guest));
         std::sort(g_functions.begin(), g_functions.end());
+    }
+
+#if defined(__APPLE__)
+    // ---- Crashes on Apple platforms. Nothing caught them before (2026-11-25: the iPhone build ended at
+    // frame 8 with nothing in the log). The report gives the signal, the address, the thread (and, for a
+    // game thread, its last import), then the stack: each frame as a recompiled function (sub_XXXXXXXX)
+    // when it is one, else the runtime's own symbol (dladdr) and its offset in the executable, which the
+    // build's symbol list (DeadRising-N.symbols.gz in the release) names.
+    struct sigaction g_previous[NSIG];
+    std::atomic<int> g_crashing{ 0 };
+
+    const char* SignalName(int signal)
+    {
+        switch (signal)
+        {
+        case SIGSEGV: return "SIGSEGV (bad memory access)";
+        case SIGBUS: return "SIGBUS (bad memory access)";
+        case SIGILL: return "SIGILL (illegal instruction)";
+        case SIGFPE: return "SIGFPE (arithmetic)";
+        case SIGTRAP: return "SIGTRAP (trap)";
+        case SIGABRT: return "SIGABRT (abort)";
+        default: return "signal";
+        }
+    }
+
+    std::string HostFrame(uintptr_t address)
+    {
+        const uintptr_t first = g_functions.empty() ? 0 : g_functions.front().first;
+        const uintptr_t last = g_functions.empty() ? 0 : g_functions.back().first + 0x100000;
+        if (address >= first && address < last)
+        {
+            Dl_info info{};
+            // Inside the recompiled code: the nearest recompiled function by host address.
+            if (dladdr(reinterpret_cast<void*>(address), &info) == 0 || info.dli_sname == nullptr || strncmp(info.dli_sname, "sub_", 4) == 0 ||
+                strncmp(info.dli_sname, "_sub_", 5) == 0)
+                return Describe(address);
+        }
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(address), &info) != 0 && info.dli_fbase != nullptr)
+        {
+            const uintptr_t offset = address - uintptr_t(info.dli_fbase);
+            const char* file = info.dli_fname ? strrchr(info.dli_fname, '/') : nullptr;
+            file = file ? file + 1 : (info.dli_fname ? info.dli_fname : "?");
+            if (info.dli_sname != nullptr)
+                return fmt::format("{}+{:X} ({} +{:X})", info.dli_sname, address - uintptr_t(info.dli_saddr), file, offset);
+            return fmt::format("{} +{:X}", file, offset);
+        }
+        return fmt::format("{:X}", address);
+    }
+
+    void CrashHandler(int signal, siginfo_t* info, void* context)
+    {
+        if (g_crashing.fetch_add(1) == 0)
+        {
+            char thread[64] = {};
+            pthread_getname_np(pthread_self(), thread, sizeof(thread));
+            const uintptr_t fault = uintptr_t(info != nullptr ? info->si_addr : nullptr);
+            std::string text = fmt::format("[crash] {} at {:X}", SignalName(signal), fault);
+            if (g_memory.base != nullptr && g_memory.IsInMemoryRange(reinterpret_cast<void*>(fault)))
+                text += fmt::format(" (game address {:08X})", g_memory.MapVirtual(reinterpret_cast<void*>(fault)));
+            text += fmt::format(", thread \"{}\"", thread[0] != 0 ? thread : (t_slot != nullptr ? t_slot->name : "?"));
+            if (t_slot != nullptr)
+            {
+                const char* import = t_slot->lastImport.load();
+                text += fmt::format(" (game thread {}, last import {} lr {:08X})", t_slot->name, import ? import : "none", t_slot->lastLr.load());
+            }
+#if defined(__arm64__) || defined(__aarch64__)
+            const ucontext_t* uc = static_cast<const ucontext_t*>(context);
+            if (uc != nullptr && uc->uc_mcontext != nullptr)
+            {
+                const auto& ss = uc->uc_mcontext->__ss;
+                std::vector<uintptr_t> frames;
+                frames.push_back(uintptr_t(arm_thread_state64_get_pc(ss)));
+                frames.push_back(uintptr_t(arm_thread_state64_get_lr(ss)));
+                const uintptr_t high = uintptr_t(pthread_get_stackaddr_np(pthread_self()));
+                const uintptr_t low = high - pthread_get_stacksize_np(pthread_self());
+                const uintptr_t sp = uintptr_t(arm_thread_state64_get_sp(ss));
+                uintptr_t fp = uintptr_t(arm_thread_state64_get_fp(ss));
+                while (frames.size() < 40 && fp >= low && fp + 16 <= high && (fp & 7) == 0)
+                {
+                    const uintptr_t next = *reinterpret_cast<const uintptr_t*>(fp);
+                    const uintptr_t ret = *reinterpret_cast<const uintptr_t*>(fp + 8) & 0x0000000FFFFFFFFFull; // pointer authentication bits off
+                    if (ret == 0)
+                        break;
+                    frames.push_back(ret);
+                    if (next <= fp)
+                        break;
+                    fp = next;
+                }
+                text += fmt::format("; sp {:X} (stack {:X}-{:X}{})", sp, low, high, sp < low + 16384 ? ", nearly full: stack overflow?" : "");
+                std::string stack, previous;
+                for (uintptr_t frame : frames)
+                {
+                    const std::string name = HostFrame(frame & 0x0000000FFFFFFFFFull);
+                    if (name == previous)
+                        continue;
+                    stack += (stack.empty() ? "" : " < ") + name;
+                    previous = name;
+                }
+                text += "; stack " + stack;
+                text += fmt::format("; x0 {:X} x1 {:X} x2 {:X} x3 {:X}", ss.__x[0], ss.__x[1], ss.__x[2], ss.__x[3]);
+            }
+#endif
+            os::logger::LogCrash(text);
+        }
+        // Back to the system's handler: the instruction runs again and the app ends as before.
+        sigaction(signal, &g_previous[signal], nullptr);
+        if (signal == SIGABRT || signal == SIGTRAP)
+            raise(signal);
+    }
+
+    void InstallCrashHandler()
+    {
+        static bool installed = false;
+        if (installed || (getenv("DR_CRASH_HANDLER") != nullptr && atoi(getenv("DR_CRASH_HANDLER")) == 0))
+            return;
+        installed = true;
+        LoadFunctions();
+        HangWatchdog::PrepareThread(); // this (the main) thread
+        struct sigaction action{};
+        action.sa_sigaction = CrashHandler;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        for (int signal : { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT })
+            sigaction(signal, &action, &g_previous[signal]);
+        // An exception nothing catches: its message, then abort (whose report gives the stack where it was thrown).
+        std::set_terminate([] {
+            std::string what = "(not a std::exception)";
+            if (std::exception_ptr exception = std::current_exception())
+            {
+                try
+                {
+                    std::rethrow_exception(exception);
+                }
+                catch (const std::exception& e)
+                {
+                    what = e.what();
+                }
+                catch (...)
+                {
+                }
+            }
+            else
+                what = "(none: std::terminate called directly)";
+            os::logger::LogCrash(fmt::format("[crash] uncaught C++ exception: {}", what));
+            abort();
+        });
+        LOGN("[crash] crash reports on (DR_CRASH_HANDLER=0 off)");
+    }
+#endif
+
+    void Thread()
+    {
+        LoadFunctions();
 
         int reports = 0;
         int64_t reportedForPresent = -1;
@@ -164,6 +324,9 @@ namespace
 
 void HangWatchdog::Start()
 {
+#if defined(__APPLE__)
+    InstallCrashHandler();
+#endif
     if (!Enabled())
         return;
     g_lastPresentMs = NowMs();
@@ -177,8 +340,27 @@ void HangWatchdog::OnPresent()
     g_presents.fetch_add(1, std::memory_order_relaxed);
 }
 
+void HangWatchdog::PrepareThread()
+{
+#if defined(__APPLE__)
+    // A stack of its own for the crash report, so a stack overflow is reported too.
+    thread_local bool prepared = false;
+    if (prepared)
+        return;
+    prepared = true;
+    constexpr size_t kSize = 128 * 1024;
+    stack_t stack{};
+    stack.ss_sp = malloc(kSize);
+    stack.ss_size = kSize;
+    stack.ss_flags = 0;
+    if (stack.ss_sp != nullptr)
+        sigaltstack(&stack, nullptr);
+#endif
+}
+
 void HangWatchdog::RegisterGuestThread(const char* name)
 {
+    PrepareThread();
     if (t_slot != nullptr)
         return;
     std::lock_guard lock(g_slotMutex);

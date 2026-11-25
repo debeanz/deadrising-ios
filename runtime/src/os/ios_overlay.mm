@@ -10,6 +10,7 @@
 #import <UIKit/UIKit.h>
 #import <GameController/GameController.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
 
 #include <string>
 #include <string_view>
@@ -21,6 +22,7 @@
 #include <gpu/video.h>
 #include <hid/input.h>
 #include <os/logger.h>
+#include <os/memory_info.h>
 #include <user/config.h>
 #include <fmt/core.h>
 
@@ -1039,9 +1041,25 @@ static void DRSetResolution(NSInteger i) /* the options menu's choices: 720p, 10
             [_text scrollRangeToVisible:NSMakeRange(text.length > 0 ? text.length - 1 : 0, 0)];
     }
 }
+- (void)drCheckMemory
+{
+    // Below 600 MB left, every 100 MB less is logged (the last line before the system ends the app says how close it was).
+    static int64_t lastStep = INT64_MAX;
+    const int64_t left = MemoryInfo::AvailableMB();
+    if (left < 0) return;
+    const int64_t step = left / 100;
+    if (left < 600 && step < lastStep)
+    {
+        lastStep = step;
+        LOGFN_WARNING("[memory] low: {}", MemoryInfo::Describe());
+    }
+    else if (lastStep != INT64_MAX && step > lastStep + 1)
+        lastStep = step; // memory came back: report the next drop again
+}
 - (void)drTick:(CADisplayLink*)l
 {
     // By itself while the game shows no picture for 3 s (starting, or stuck); gone again once pictures come.
+    [self drCheckMemory];
     const double waited = Video::SecondsSinceGameFrame();
     if (!_userOpen)
     {
@@ -1137,6 +1155,10 @@ void Overlay::Create(SDL_Window* window)
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification* n) {
         Video::SetAppActive(true);
     }];
+    // iOS ends an app over its memory limit without a message: its warnings, and how close the app is, go to the log.
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification* n) {
+        LOGFN_WARNING("[memory] iOS memory warning: {}", MemoryInfo::Describe());
+    }];
     LOGN("[overlay] native controls, Settings (gear / three fingers) and live log (four fingers) ready");
 }
 
@@ -1146,4 +1168,17 @@ void Overlay::ToggleSettings()
         return;
     [g_overlay.pad drReleaseAll];
     if (g_overlay.panel.drOpen) [g_overlay.panel drHide]; else [g_overlay.panel drShow];
+}
+
+bool IosGpu::SupportsBCTextures()
+{
+    @autoreleasepool
+    {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil)
+            return false;
+        if (@available(iOS 16.4, *))
+            return [device supportsBCTextureCompression];
+        return false;
+    }
 }
