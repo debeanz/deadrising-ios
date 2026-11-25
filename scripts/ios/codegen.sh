@@ -63,10 +63,19 @@ cmake -S tools/XenosRecomp -B build/host/XenosRecomp "${HOST_FLAGS[@]}"
 cmake --build build/host/XenosRecomp --target XenosRecomp
 XENOSRECOMP="$(find build/host/XenosRecomp -type f -name XenosRecomp -perm -u+x | head -n 1)"
 DXC_LIB="$ROOT/tools/XenosRecomp/thirdparty/dxc-bin/lib/$(uname -m | sed 's/x86_64/x64/')"
+echo "dxcompiler: $(ls -l "$DXC_LIB"/libdxcompiler.dylib 2>&1)"
+otool -L "$XENOSRECOMP" | grep -i dxc || true
+# Full output in analysis/shader_cache/xenosrecomp.log (it names the game's shaders: private log
+# only); here the exit status, the counts and the last lines that are not per-shader.
+set +e
 DYLD_LIBRARY_PATH="$DXC_LIB" LD_LIBRARY_PATH="$DXC_LIB" "$XENOSRECOMP" analysis/shaders_2008 \
     analysis/shader_cache/shader_cache.cpp tools/XenosRecomp/XenosRecomp/shader_common.h \
-    | grep -E "Translated|FAILED" || true
-test -s analysis/shader_cache/shader_cache.cpp
+    > analysis/shader_cache/xenosrecomp.log 2>&1
+status=$?
+set -e
+echo "XenosRecomp exit status $status: $(grep -c Translated analysis/shader_cache/xenosrecomp.log || true) translated, $(grep -c FAILED analysis/shader_cache/xenosrecomp.log || true) failed"
+grep -v -E "Translated|FAILED" analysis/shader_cache/xenosrecomp.log | tail -25 || true
+test -s analysis/shader_cache/shader_cache.cpp || { echo "error: XenosRecomp wrote no shader_cache.cpp"; exit 1; }
 
 step "Done"
 echo "ppc/ and analysis/ are ready; configure the runtime with CMAKE_SYSTEM_NAME=iOS (docs/ios.md)."
