@@ -1,5 +1,6 @@
 #include <stdafx.h>
 #include <profiler/cpu_sampler.h>
+#include <os/hang_watchdog.h>
 #include "guest_thread.h"
 #include <kernel/memory.h>
 #include <kernel/heap.h>
@@ -137,7 +138,9 @@ uint32_t GuestThread::Start(const GuestThreadParams& params)
 
     GuestThreadContext ctx(cpuNumber);
     ctx.ppcContext.r3.u64 = params.value;
-    CpuSampler::RegisterCurrentThread(fmt::format("guest thread sub_{:08X} (cpu {})", params.function, cpuNumber).c_str()); // DR_CPU_PROFILE=1
+    const std::string threadName = fmt::format("guest thread sub_{:08X} (cpu {})", params.function, cpuNumber);
+    CpuSampler::RegisterCurrentThread(threadName.c_str()); // DR_CPU_PROFILE=1
+    HangWatchdog::RegisterGuestThread(threadName.c_str()); // "[watchdog]" when frames stop
 
     g_memory.FindFunction(params.function)(ctx.ppcContext, g_memory.base);
 

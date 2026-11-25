@@ -18,6 +18,7 @@
 #include "virtual_memory.h"
 #include "io/file_system_dr.h"
 #include "imports_dr.h"
+#include <os/hang_watchdog.h>
 #include <gpu/command_processor.h>
 #include <apu/audio.h>
 #include <apu/xma.h>
@@ -57,6 +58,7 @@ static const bool g_traceImports = []
 
 void TraceImportCall(const char* name, PPCContext& ctx)
 {
+    HangWatchdog::NoteImport(name, uint32_t(ctx.lr)); // "[watchdog]": each guest thread's last import
     if (!g_traceImports)
         return;
 

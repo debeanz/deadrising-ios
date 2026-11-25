@@ -16,6 +16,7 @@
 #include <hid/input.h>
 #include <hid/touch_controls.h>
 #include <os/logger.h>
+#include <os/hang_watchdog.h>
 #include <profiler/cpu_sampler.h>
 
 #include <cfloat>
@@ -3199,6 +3200,7 @@ void Renderer::OnPresent(uint32_t device)
         t_watched = true;
         CpuSampler::WatchHitches(); // "[hitch profile]" for frames with over 50 ms of game work (DR_HITCH_PROFILE=0 off)
     }
+    HangWatchdog::OnPresent();
     const auto presentStart = std::chrono::steady_clock::now();
     static auto lastPresent = presentStart;
     g_timing.guestFrameUs += uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(presentStart - lastPresent).count());

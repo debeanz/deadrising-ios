@@ -135,6 +135,7 @@ set(DR_RUNTIME_SOURCES
     src/user/config.cpp
     src/ui/options_menu.cpp
     src/profiler/cpu_sampler.cpp
+    src/os/hang_watchdog.cpp
 )
 list(APPEND DR_RUNTIME_SOURCES src/os/logger_win32.cpp) # stdio: portable despite the name
 

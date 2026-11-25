@@ -417,6 +417,8 @@ namespace
 #endif
 }
 
+#include <os/hang_watchdog.h>
+
 static int DRMain(int argc, char* argv[]);
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -506,6 +508,8 @@ static int DRMain(int argc, char* argv[])
 
     if (g_timeStampBundle)
         std::thread(TimeStampThread).detach();
+
+    HangWatchdog::Start(); // "[watchdog]": what each game thread does when frames stop
 
 #ifdef __APPLE__
     // UIKit needs SDL on the main thread: the video loop keeps it, the game gets its own thread.
