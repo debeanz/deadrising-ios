@@ -147,7 +147,15 @@ jobs:
           ok="${{ job.status }}"
           title="iOS build ${{ github.run_number }}"
           [ "$ok" = "success" ] || title="$title - FAILED (logs only)"
-          gh release create "$TAG" --repo "$DATA_REPO" --title "$title" \
-            --notes "From ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}, run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Install with SideStore, AltStore, Sideloadly or LiveContainer, keeping the entitlements (docs/ios.md). Copy your game folder to Files > On My iPhone > Dead Rising > game." \
-            ./*
+          notes="From ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}, run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Install with SideStore, AltStore, Sideloadly or LiveContainer, keeping the entitlements (docs/ios.md). Copy your game folder to Files > On My iPhone > Dead Rising > game."
+          # GitHub's API sometimes answers 500: try a few times (a half-made release is uploaded to).
+          for attempt in 1 2 3 4; do
+            if gh release view "$TAG" --repo "$DATA_REPO" >/dev/null 2>&1; then
+              gh release upload "$TAG" --repo "$DATA_REPO" --clobber ./* && break
+            else
+              gh release create "$TAG" --repo "$DATA_REPO" --title "$title" --notes "$notes" ./* && break
+            fi
+            echo "attempt $attempt failed, retrying"; sleep $((attempt * 15))
+          done
+          gh release view "$TAG" --repo "$DATA_REPO" >/dev/null
           echo "Delivered to the private repository: release $TAG"
