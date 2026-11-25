@@ -1,8 +1,8 @@
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index d015145..fa92fe3 100644
+index d015145..a004f3e 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
-@@ -1,7 +1,28 @@
+@@ -1,7 +1,105 @@
 +#include <fstream>
 +#include <mutex>
  #include "shader.h"
@@ -28,10 +28,87 @@ index d015145..fa92fe3 100644
 +#endif
 +}
 +
++#ifndef _WIN32
++#include <algorithm>
++#include <atomic>
++#include <csignal>
++#include <execinfo.h>
++#include <pthread.h>
++#include <thread>
++#include <unistd.h>
++
++// Dead Rising (iOS build on macOS): a fault prints the stack (on its own signal stack, so a stack
++// overflow is reported too) instead of ending the run silently with status 139.
++static void CrashHandler(int signal)
++{
++    void* frames[64];
++    const int count = backtrace(frames, 64);
++    char message[64];
++    const int length = snprintf(message, sizeof(message), "XenosRecomp: signal %d, stack:\n", signal);
++    write(2, message, length);
++    backtrace_symbols_fd(frames, count, 2);
++    _exit(128 + signal);
++}
++
++static void InstallCrashHandler()
++{
++    static char alternateStack[1 << 16];
++    stack_t stack{};
++    stack.ss_sp = alternateStack;
++    stack.ss_size = sizeof(alternateStack);
++    sigaltstack(&stack, nullptr);
++    struct sigaction action{};
++    action.sa_handler = CrashHandler;
++    action.sa_flags = SA_ONSTACK;
++    sigaction(SIGSEGV, &action, nullptr);
++    sigaction(SIGBUS, &action, nullptr);
++    sigaction(SIGILL, &action, nullptr);
++    sigaction(SIGABRT, &action, nullptr);
++}
++
++// Each item on worker threads with 64 MB stacks: macOS gives std::execution's (libdispatch) worker
++// threads 512 KB, and DXC's compiler needs more.
++template<class Items, class Function>
++static void ParallelForBigStack(Items& items, Function function)
++{
++    std::vector<typename Items::iterator> list;
++    for (auto it = items.begin(); it != items.end(); ++it)
++        list.push_back(it);
++    struct Shared
++    {
++        std::vector<typename Items::iterator>* list;
++        Function* function;
++        std::atomic<size_t> next{ 0 };
++    } shared{ &list, &function };
++    auto run = [](void* argument) -> void*
++    {
++        auto* s = static_cast<Shared*>(argument);
++        stack_t stack{};
++        static thread_local char alternateStack[1 << 16];
++        stack.ss_sp = alternateStack;
++        stack.ss_size = sizeof(alternateStack);
++        sigaltstack(&stack, nullptr);
++        for (size_t i; (i = s->next++) < s->list->size();)
++            (*s->function)(*(*s->list)[i]);
++        return nullptr;
++    };
++    const unsigned threads = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
++    std::vector<pthread_t> handles(threads);
++    pthread_attr_t attributes;
++    pthread_attr_init(&attributes);
++    pthread_attr_setstacksize(&attributes, size_t(64) << 20);
++    for (auto& handle : handles)
++        pthread_create(&handle, &attributes, run, &shared);
++    for (auto& handle : handles)
++        pthread_join(handle, nullptr);
++    pthread_attr_destroy(&attributes);
++}
++#endif
++
  static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
  {
      FILE* file = fopen(filePath, "rb");
-@@ -27,6 +48,7 @@ struct RecompiledShader
+@@ -27,10 +125,15 @@ struct RecompiledShader
      IDxcBlob* dxil = nullptr;
      std::vector<uint8_t> spirv;
      uint32_t specConstantsMask = 0;
@@ -39,15 +116,24 @@ index d015145..fa92fe3 100644
  };
  
  int main(int argc, char** argv)
-@@ -114,6 +136,7 @@ int main(int argc, char** argv)
+ {
++#ifndef _WIN32
++    setvbuf(stdout, nullptr, _IONBF, 0); // progress reaches the log even if the run dies
++    InstallCrashHandler();
++#endif
+ #ifndef XENOS_RECOMP_INPUT
+     if (argc < 4)
+     {
+@@ -114,27 +217,73 @@ int main(int argc, char** argv)
          }
  
          std::atomic<uint32_t> progress = 0;
 +        std::atomic<uint32_t> failures = 0;
  
-         std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
+-        std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
++        auto translate = [&](auto& hashShaderPair)
              {
-@@ -121,20 +144,65 @@ int main(int argc, char** argv)
+                 auto& shader = hashShaderPair.second;
  
                  thread_local ShaderRecompiler recompiler;
                  recompiler = {};
@@ -117,15 +203,23 @@ index d015145..fa92fe3 100644
  
                  bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
                  assert(result);
-@@ -146,6 +214,7 @@ int main(int argc, char** argv)
+@@ -144,8 +293,14 @@ int main(int argc, char** argv)
+                 size_t currentProgress = ++progress;
+                 if ((currentProgress % 10) == 0 || (currentProgress == shaders.size() - 1))
                      fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
-             });
+-            });
++            };
++#ifdef _WIN32
++        std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), translate);
++#else
++        ParallelForBigStack(shaders, translate);
++#endif
  
 +        fmt::println("Translated {} shaders, {} failed (their HLSL is in the 'failed' folder next to the output)", shaders.size(), failures.load());
          fmt::println("Creating shader cache...");
  
          StringBuffer f;
-@@ -157,8 +226,9 @@ int main(int argc, char** argv)
+@@ -157,8 +312,9 @@ int main(int argc, char** argv)
  
          for (auto& [hash, shader] : shaders)
          {
